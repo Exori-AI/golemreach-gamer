@@ -20,6 +20,9 @@ Each window first asks for a **Codex** session (`gpt-5.6-terra` via the `codex` 
 usage or rate-limited, the same character plays the rest of the window on a **free-tier open model**
 (NVIDIA-hosted, through the hermes agent), and Codex is tried again next window. Errors never loop:
 two failed or four short sessions in a row end the Codex arm for that window.
+On the free model, a rate-limited session backs off 2-5 min (jittered so characters don't retry in
+lockstep), and hermes falls back through `GAMER_FALLBACK_MODELS` (space-separated NVIDIA model ids,
+written into the hermes config at startup).
 
 - `codex/dispatch.sh` — runs on the host (cron, every minute). The runner container drops a request file
   per character into a shared queue; the dispatcher claims it atomically and starts one throwaway

@@ -290,8 +290,10 @@ play_window() {
         capture_transcript "$slot"
         if printf '%s' "$out" | grep -qE "HTTP 429|Too Many Requests|rate limit"; then
             errors=$(( errors + 1 ))
-            log "slot $slot: session ended (exit $rc) on a rate limit — backing off 180s"
-            sleep 180
+            # jittered, so concurrent slots don't retry the shared key in lockstep
+            local backoff=$(( 120 + RANDOM % 180 ))
+            log "slot $slot: session ended (exit $rc) on a rate limit — backing off ${backoff}s"
+            sleep "$backoff"
         else
             log "slot $slot: session ended (exit $rc) — continuing window in 5s"
             sleep 5
@@ -345,6 +347,19 @@ fi
 hermes config set memory.memory_enabled false >/dev/null 2>&1 \
     && hermes config set memory.user_profile_enabled false >/dev/null 2>&1 \
     || log "WARNING: could not disable hermes shared memory"
+
+# hermes tries these on a 429/overload before a session gives up. Keep them to
+# models NIM still serves (dead ids return 410 and waste the retry).
+FALLBACK_MODELS="${GAMER_FALLBACK_MODELS:-nvidia/nemotron-3-super-120b-a12b z-ai/glm-5.3-flash}"
+FALLBACK_MODELS="$FALLBACK_MODELS" python3 - "$HERMES_DIR/config.yaml" <<'PY' \
+    && log "hermes fallback chain: $FALLBACK_MODELS" || log "WARNING: could not set hermes fallback chain"
+import os, re, sys
+p = sys.argv[1]; s = open(p).read()
+block = "fallback_providers:\n" + "".join(
+    f"  - provider: nvidia\n    model: {m}\n" for m in os.environ["FALLBACK_MODELS"].split())
+s, n = re.subn(r"^fallback_providers:\n(?:[ -].*\n)*", block, s, flags=re.M)
+open(p, "w").write(s if n else s + block)
+PY
 
 playable() {
     ! slot_disabled "$1" && [ -n "$(slot_var "$1" API_KEY)" ] && [ -n "$(slot_var "$1" CHARACTER_ID)" ]
