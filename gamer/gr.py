@@ -169,6 +169,7 @@ def hunt(secs, only, keep, retreat_pct):
     full capacity. Prints a summary the LLM can act on."""
     end = time.time() + secs
     kills, xp0, log, stop_reason = 0, None, [], "time up"
+    start = None
     last_target_pick = 0
     obs = obs_of(observe())
     while time.time() < end:
@@ -178,6 +179,7 @@ def hunt(secs, only, keep, retreat_pct):
             break
         if xp0 is None:
             xp0 = s.get("experience", 0)
+            start = s.get("position")
         evs = [(e.get("text") or e.get("message") or "") for e in obs.get("events") or []]
         for t in evs:
             if "defeated" in t:
@@ -220,6 +222,20 @@ def hunt(secs, only, keep, retreat_pct):
         if hp * 100 < retreat_pct * mhp:
             act({"type": "stop", "what": "attack"})
             stop_reason = f"LOW HP {hp}/{mhp} — retreat now (walk away / heal / temple)"
+            # walk back to where the hunt began (known reachable) in code: a slow model
+            # hand-pathing out of a swarm is how characters die
+            sp = s.get("position") or {}
+            if start and sp.get("z") == start.get("z") and max(
+                    abs(sp.get("x", 0) - start.get("x", 0)), abs(sp.get("y", 0) - start.get("y", 0))) > 1:
+                ok = False
+                for avoid in (True, False):   # boxed in, avoidance may find no path
+                    r = act({"type": "walk_to", "target": start, "avoidCreatures": avoid})
+                    ok = ((r or {}).get("result") or {}).get("ok")
+                    if ok:
+                        break
+                time.sleep(3)
+                obs = obs_of(observe()) or obs
+                stop_reason += f"; auto-retreating to hunt start {pos(start)} (ok={ok})"
             break
         if (s.get("capacity") or 999) < 15:
             stop_reason = "backpack nearly full — go sell"
