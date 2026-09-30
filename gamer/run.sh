@@ -1,5 +1,6 @@
 #!/bin/bash
-# Golemreach gamer runner: one character online at a time, slots alternate.
+# Golemreach gamer runner: every slot plays in its own loop, concurrently,
+# with staggered starts (a small party online together).
 # The game is real-time (10 ticks/s) and a slow LLM can't react per tick, so the
 # model plays through /gamer/gr.py: compact views, single actions, and a bounded
 # `hunt` routine that fights/loots/eats at tick speed and stops itself.
@@ -17,6 +18,12 @@ WRAPUP_SECONDS="${WRAPUP_SECONDS:-600}"
 COACH_MODEL="${COACH_MODEL:-nvidia/nemotron-3-super-120b-a12b}"
 COACH_TIMEOUT="${COACH_TIMEOUT:-900}"
 PLAY_MAX_TURNS="${PLAY_MAX_TURNS:-300}"
+# ~3.5 model calls/min per live session; 4 fit the free tier's rate limit.
+MAX_CONCURRENT="${GAMER_MAX_CONCURRENT:-4}"
+# Offsets between slot starts. Keep the span short so every cycle still has a
+# window where ALL slots rest (the db-maintenance job only runs then).
+STAGGER_SECONDS="${GAMER_STAGGER_SECONDS:-1800}"
+SEAT_DIR=/tmp/gamer-seats
 
 # Nth slot in GAMER_SLOTS reads GAMERn_API_KEY (Bearer token) and
 # GAMERn_CHARACTER_ID; playstyle comes from gamer/strategy-<slot>.md.
@@ -30,6 +37,7 @@ slot_disabled() {
 }
 
 log() { echo "[gamer] $(date -u '+%F %T') $*"; }
+slot_tag() { printf '[slot:%s]' "$1"; }   # first chars of every prompt: sessions list shows it
 
 slot_var() {   # slot_var <slot> <SUFFIX> -> value of GAMERn_<SUFFIX>
     local i=1 s
@@ -69,7 +77,7 @@ cap_file() { [ -f "$1" ] && head -c "$2" "$1"; }
 
 build_prompt() {
     local slot="$1" dir="$WS/$1"
-    printf '%s\n\n%s\n\n' "$PREFIX" "$SECURITY"
+    printf '%s %s\n\n%s\n\n' "$(slot_tag "$slot")" "$PREFIX" "$SECURITY"
     printf 'YOUR NOTEBOOK DIRECTORY is %s — read and write notebook files there with absolute paths.\n\n' "$dir"
     printf '=== YOUR STRATEGY (defines your playstyle; outranks generic advice) ===\n'
     cap_file "/gamer/strategy-$slot.md" 10000
@@ -85,7 +93,7 @@ build_prompt() {
 
 wrapup_prompt() {
     local dir="$WS/$1"
-    printf '%s\n\n%s\n\n' "$PREFIX" "$SECURITY"
+    printf '%s %s\n\n%s\n\n' "$(slot_tag "$1")" "$PREFIX" "$SECURITY"
     printf 'WRAP-UP: your play window is over. Do exactly this, then stop:\n'
     printf '1. python3 /gamer/gr.py look. If you are in a fight or in danger, get out of it (stop attacking, walk away toward town).\n'
     printf '2. If a temple / protection zone (P on the map, or the temple you respawn at) is reasonably near, walk_to it so you log out safely. Do not start new fights.\n'
@@ -110,10 +118,11 @@ rotate_logs() {
 
 # hermes -z prints only the final message; the real play (tool calls, views)
 # lives in the session store. Digest the newest session and ACCUMULATE per
-# window so the coach sees the whole window, not the last stub.
+# window so the coach sees the whole window, not the last stub. Slots run
+# concurrently, so pick the newest session whose preview carries OUR tag.
 capture_transcript() {
     local slot="$1" dir="$WS/$1" sid raw
-    sid=$(hermes sessions list 2>/dev/null | awk 'NR==3 {print $NF}')
+    sid=$(hermes sessions list --limit 50 2>/dev/null | grep -F "$(slot_tag "$slot")" | head -1 | awk '{print $NF}')
     [ -n "$sid" ] || { log "slot $slot: no session id found — transcript skipped"; return; }
     raw="$dir/.transcript-export.tmp"
     if ! hermes sessions export --session-id "$sid" - > "$raw" 2>/dev/null; then
@@ -199,7 +208,7 @@ play_window() {
         log "slot $slot: hermes play session (${left}s left in window)"
         out=$(timeout "$left" hermes -z "$(build_prompt "$slot")" 2>&1)
         rc=$?
-        printf '%s\n' "$out" | tail -n 20
+        printf '%s\n' "$out" | tail -n 20 | sed "s/^/[$slot] /"
         printf '%s\n' "$out" > "$dir/LAST_SESSION_OUTPUT.txt"
         { printf '\n===== %s session %s (exit %s) =====\n' "$slot" "$(date -u '+%F %T')" "$rc"; printf '%s\n' "$out"; } >> "$dir/SESSION_OUTPUT_ARCHIVE.txt"
         capture_transcript "$slot"
@@ -214,7 +223,7 @@ play_window() {
 
     log "slot $slot: window over — wrap-up session (walk to safety, log)"
     out=$(timeout "$WRAPUP_SECONDS" hermes -z "$(wrapup_prompt "$slot")" 2>&1)
-    printf '%s\n' "$out" | tail -n 5
+    printf '%s\n' "$out" | tail -n 5 | sed "s/^/[$slot] /"
     capture_transcript "$slot"
     after=$(python3 /gamer/gr.py status 2>&1)
     log "slot $slot: window closed — before $before | after $after"
@@ -249,29 +258,59 @@ if hermes config set agent.max_turns "$PLAY_MAX_TURNS" >/dev/null 2>&1; then
 else
     log "WARNING: could not set hermes agent.max_turns"
 fi
+# hermes' built-in memory is shared by every slot; each character's memory is
+# its own notebook directory, so keep the shared one off (no cross-talk).
+hermes config set memory.memory_enabled false >/dev/null 2>&1 \
+    && hermes config set memory.user_profile_enabled false >/dev/null 2>&1 \
+    || log "WARNING: could not disable hermes shared memory"
 
-while true; do
-    now=$(date +%s)
-    pick=""; pick_t=0; soonest=0
-    # least-recently-scheduled due slot plays first (never-played slots have t=0)
-    for s in $SLOTS; do
-        slot_disabled "$s" && continue
-        [ -z "$(slot_var "$s" API_KEY)" ] && continue
-        [ -z "$(slot_var "$s" CHARACTER_ID)" ] && continue
-        t=$(read_state "$s")
-        if [ "$t" -le "$now" ]; then
-            if [ -z "$pick" ] || [ "$t" -lt "$pick_t" ]; then pick="$s"; pick_t="$t"; fi
-        elif [ "$soonest" -eq 0 ] || [ "$t" -lt "$soonest" ]; then
-            soonest="$t"
-        fi
+playable() {
+    ! slot_disabled "$1" && [ -n "$(slot_var "$1" API_KEY)" ] && [ -n "$(slot_var "$1" CHARACTER_ID)" ]
+}
+
+# at most MAX_CONCURRENT windows at once: a window holds a seat (mkdir is atomic)
+take_seat() {
+    local k
+    while true; do
+        for k in $(seq 1 "$MAX_CONCURRENT"); do
+            mkdir "$SEAT_DIR/seat-$k" 2>/dev/null && { echo "$k"; return; }
+        done
+        sleep 60
     done
-    if [ -n "$pick" ]; then
-        play_window "$pick"
-    elif [ "$soonest" -gt 0 ]; then
-        log "all slots resting — sleeping until $(date -u -d "@$soonest" '+%F %T') UTC"
-        sleep $(( soonest - now ))
-    else
-        log "no playable slots — sleeping 600s"
-        sleep 600
+}
+
+slot_loop() {   # runs in its own subshell: GR_* exports stay per slot
+    local slot="$1" offset="$2" t now seat
+    t=$(read_state "$slot"); now=$(date +%s)
+    if [ "$t" -le "$now" ] && [ "$offset" -gt 0 ]; then
+        log "slot $slot: staggered start in ${offset}s"
+        sleep "$offset"
     fi
+    while true; do
+        t=$(read_state "$slot"); now=$(date +%s)
+        if [ "$t" -gt "$now" ]; then
+            log "slot $slot: resting until $(date -u -d "@$t" '+%F %T') UTC"
+            sleep $(( t - now ))
+            continue
+        fi
+        seat=$(take_seat)
+        play_window "$slot"
+        rmdir "$SEAT_DIR/seat-$seat" 2>/dev/null
+    done
+}
+
+rm -rf "$SEAT_DIR"; mkdir -p "$SEAT_DIR"
+idx=0
+for s in $SLOTS; do
+    playable "$s" || continue
+    ( slot_loop "$s" $(( idx * STAGGER_SECONDS )) ) &
+    log "slot $s: loop started (pid $!)"
+    idx=$(( idx + 1 ))
 done
+if [ "$idx" -eq 0 ]; then
+    log "no playable slots — sleeping 600s"; sleep 600; exit 1
+fi
+log "$idx slot loop(s) running, max $MAX_CONCURRENT online, stagger ${STAGGER_SECONDS}s"
+wait
+log "all slot loops exited — restarting container"
+exit 1
