@@ -56,7 +56,30 @@ def act(action):
 def obs_of(resp):
     if not isinstance(resp, dict):
         return {}
-    return resp.get("observation") or (resp if "self" in resp else {})
+    o = resp.get("observation") or (resp if "self" in resp else {})
+    note_deaths(o)
+    return o
+
+
+def note_deaths(o):
+    """Runner bookkeeping: append each death to $GR_EVENTS_FILE (deduped)."""
+    path = os.environ.get("GR_EVENTS_FILE")
+    if not path:
+        return
+    for e in o.get("events") or []:
+        t = (e.get("text") or e.get("message") or "") if isinstance(e, dict) else ""
+        if "You were killed" not in t and "You wake at" not in t:
+            continue
+        try:
+            last = (open(path).read().splitlines() if os.path.exists(path) else [])[-1:] or [""]
+            lt = last[0].partition("\t")[0]
+            # "You were killed" + "You wake at" (and re-sent event buffers) = one death
+            if time.time() - float(lt or 0) < 90:
+                continue
+            with open(path, "a") as f:
+                f.write("%d\t%s\n" % (time.time(), t[:200].replace("\n", " ")))
+        except (OSError, ValueError):
+            pass
 
 
 def pos(p):

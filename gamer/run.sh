@@ -24,10 +24,16 @@ MAX_CONCURRENT="${GAMER_MAX_CONCURRENT:-4}"
 # window where ALL slots rest (the db-maintenance job only runs then).
 STAGGER_SECONDS="${GAMER_STAGGER_SECONDS:-1800}"
 SEAT_DIR=/tmp/gamer-seats
+# Each window first asks the host for a Codex window (codex/dispatch.sh); on a
+# usage/rate limit, no pickup or an error the free model plays the rest of it.
+CODEX_MODE="${GAMER_CODEX:-on}"
+CODEX_MODEL_NAME="${GAMER_CODEX_MODEL:-gpt-5.6-terra}"
+CODEX_Q="$WS/.codex"
+CODEX_PICKUP_SECONDS="${GAMER_CODEX_PICKUP_SECONDS:-150}"
 
 # Nth slot in GAMER_SLOTS reads GAMERn_API_KEY (Bearer token) and
 # GAMERn_CHARACTER_ID; playstyle comes from gamer/strategy-<slot>.md.
-SLOTS="${GAMER_SLOTS:-exori adori}"
+SLOTS="${GAMER_SLOTS:-vallum adori}"
 DISABLED_SLOTS="${GAMER_DISABLED_SLOTS:-}"
 
 slot_disabled() {
@@ -184,10 +190,57 @@ Append a 3-6 line dated entry to $dir/SESSION_LOG.md. Keep only what changes fut
     log "slot $slot: coach FAILED to write notebooks after 2 attempts — continuing"
 }
 
+free_model() { sed -n '/^model:/,/^[^ ]/s/^  default: *//p' "$HERMES_DIR/config.yaml" 2>/dev/null | head -1; }
+
+xp_of() {   # xp_of <status json> -> "level experience"
+    printf '%s' "$1" | python3 -c 'import json,sys
+try: d=json.load(sys.stdin); print(d.get("level","?"), d.get("experience","?"))
+except Exception: print("? ?")' 2>/dev/null
+}
+
+# one row per model segment of a window -> $WS/MODEL_WINDOWS.tsv (model comparison)
+model_row() {   # slot model t0 t1 before after sessions stalls errors note
+    local f="$WS/MODEL_WINDOWS.tsv" deaths
+    [ -s "$f" ] || printf 'slot\tcharacter\tmodel\tstart\tend\tonline_min\tlevel0\txp0\tlevel1\txp1\tdeaths\tsessions\tstalls\terrors\tnote\n' > "$f"
+    deaths=$(awk -F'\t' -v a="$3" -v b="$4" '$1>=a && $1<b' "$WS/$1/DEATHS.tsv" 2>/dev/null | wc -l)
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$GR_CHARACTER" "$2" \
+        "$(date -u -d "@$3" '+%FT%TZ')" "$(date -u -d "@$4" '+%FT%TZ')" "$(( ($4 - $3 + 30) / 60 ))" \
+        "$(xp_of "$5" | tr ' ' '\t')" "$(xp_of "$6" | tr ' ' '\t')" "$deaths" "$7" "$8" "$9" \
+        "$(printf '%s' "${10}" | tr '\t\n' '  ' | head -c 200)" >> "$f"
+}
+
+# codex_window <slot> <end>: blocks while Codex plays; sets CODEX_STATE
+codex_window() {
+    local slot="$1" end="$2" waited=0 st
+    CODEX_STATE=off
+    [ "$CODEX_MODE" = on ] || return
+    mkdir -p "$CODEX_Q"
+    rm -f "$CODEX_Q/$slot".status "$CODEX_Q/$slot".taken "$CODEX_Q/$slot".cancel "$WS/$slot/.codex-result"
+    { build_prompt "$slot"
+      printf 'This window ends at %s UTC. Keep playing (hunt, walk_to, loot, notebook) until then; finish your session only when under 3 minutes remain.\n' \
+          "$(date -u -d "@$end" '+%H:%M')"; } > "$CODEX_Q/$slot.prompt"
+    printf 'end=%s\n' "$end" > "$CODEX_Q/$slot.req.tmp" && mv "$CODEX_Q/$slot.req.tmp" "$CODEX_Q/$slot.req"
+    log "slot $slot: asked the host for a codex ($CODEX_MODEL_NAME) window"
+    while :; do
+        sleep 10; waited=$(( waited + 10 ))
+        st=$(head -1 "$CODEX_Q/$slot.status" 2>/dev/null | sed 's/ at=[0-9]*$//')
+        case "$st" in
+            ''|running) ;;
+            *) CODEX_STATE="$st"; break ;;
+        esac
+        if [ -z "$st" ] && [ "$waited" -ge "$CODEX_PICKUP_SECONDS" ] \
+            && mv "$CODEX_Q/$slot.req" "$CODEX_Q/$slot.cancel" 2>/dev/null; then
+            CODEX_STATE=nopickup; break   # the dispatcher never claimed it
+        fi
+        if [ "$(date +%s)" -gt $(( end + 600 )) ]; then CODEX_STATE=lost; break; fi
+    done
+    rm -f "$CODEX_Q/$slot.req" "$CODEX_Q/$slot.cancel" "$CODEX_Q/$slot.taken"
+}
+
 play_window() {
     local slot="$1" dir="$WS/$1"
     mkdir -p "$dir"
-    export GR_TOKEN GR_BASE="$BASE" GR_CHARACTER
+    export GR_TOKEN GR_BASE="$BASE" GR_CHARACTER GR_EVENTS_FILE="$dir/DEATHS.tsv"
     GR_TOKEN=$(slot_var "$slot" API_KEY)
     GR_CHARACTER=$(slot_var "$slot" CHARACTER_ID)
     local out rc left start end before after
@@ -202,17 +255,41 @@ play_window() {
     before=$(python3 /gamer/gr.py status 2>&1)
     log "slot $slot: window open until $(date -u -d "@$end" '+%T') UTC — $before"
 
+    local seg_t0 seg_before seg_after res sessions=0 stalls=0 errors=0 t1
+    seg_t0=$(date +%s); seg_before="$before"
+    codex_window "$slot" "$end"
+    if [ "$CODEX_STATE" != off ]; then
+        seg_after=$(python3 /gamer/gr.py status 2>&1)
+        res=$(cat "$dir/.codex-result" 2>/dev/null)
+        log "slot $slot: codex segment ended: $CODEX_STATE ${res:+— $res}"
+        if [ -n "$res" ]; then
+            model_row "$slot" "codex:$CODEX_MODEL_NAME" "$seg_t0" "$(date +%s)" "$seg_before" "$seg_after" \
+                "$(printf '%s' "$res" | sed -n 's/.*sessions=\([0-9]*\).*/\1/p')" \
+                "$(printf '%s' "$res" | sed -n 's/.*stalls=\([0-9]*\).*/\1/p')" \
+                "$(printf '%s' "$res" | sed -n 's/.*errors=\([0-9]*\).*/\1/p')" "$CODEX_STATE ${res##*detail=}"
+        else
+            model_row "$slot" "codex:$CODEX_MODEL_NAME" "$seg_t0" "$(date +%s)" "$seg_before" "$seg_after" 0 0 1 "$CODEX_STATE"
+        fi
+        seg_before="$seg_after"
+        [ "$(( end - $(date +%s) ))" -ge 120 ] && log "slot $slot: free model ($(free_model)) plays the rest of the window"
+    fi
+    seg_t0=$(date +%s)
+
     while [ "$(date +%s)" -lt "$end" ]; do
         left=$(( end - $(date +%s) ))
         [ "$left" -lt 120 ] && break
         log "slot $slot: hermes play session (${left}s left in window)"
+        t1=$(date +%s)
         out=$(timeout "$left" hermes -z "$(build_prompt "$slot")" 2>&1)
         rc=$?
+        sessions=$(( sessions + 1 ))
+        [ $(( $(date +%s) - t1 )) -lt 90 ] && stalls=$(( stalls + 1 ))
         printf '%s\n' "$out" | tail -n 20 | sed "s/^/[$slot] /"
         printf '%s\n' "$out" > "$dir/LAST_SESSION_OUTPUT.txt"
         { printf '\n===== %s session %s (exit %s) =====\n' "$slot" "$(date -u '+%F %T')" "$rc"; printf '%s\n' "$out"; } >> "$dir/SESSION_OUTPUT_ARCHIVE.txt"
         capture_transcript "$slot"
         if printf '%s' "$out" | grep -qE "HTTP 429|Too Many Requests|rate limit"; then
+            errors=$(( errors + 1 ))
             log "slot $slot: session ended (exit $rc) on a rate limit — backing off 180s"
             sleep 180
         else
@@ -220,6 +297,11 @@ play_window() {
             sleep 5
         fi
     done
+    if [ "$sessions" -gt 0 ]; then
+        seg_after=$(python3 /gamer/gr.py status 2>&1)
+        model_row "$slot" "free:$(free_model)" "$seg_t0" "$(date +%s)" "$seg_before" "$seg_after" \
+            "$sessions" "$stalls" "$errors" "${CODEX_STATE:+after codex=$CODEX_STATE}"
+    fi
 
     log "slot $slot: window over — wrap-up session (walk to safety, log)"
     out=$(timeout "$WRAPUP_SECONDS" hermes -z "$(wrapup_prompt "$slot")" 2>&1)
