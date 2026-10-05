@@ -11,8 +11,15 @@ RES="$DIR/.codex-result"
 TMP="$HOME/run"; mkdir -p "$TMP"
 LIMIT_RE='usage limit|usage_limit|rate.?limit|Too Many Requests|429|quota|insufficient_quota'
 AUTH_RE='401|Unauthorized|unauthorized|refresh.?token|not logged in|log ?in again'
-sessions=0; stalls=0; errors=0; fails=0; short=0; outcome=played; detail=
+sessions=0; stalls=0; errors=0; fails=0; short=0; outcome=played; detail=; reset=
 now() { date +%s; }
+# "...try again at Oct 10th, 2026 12:18 AM." -> epoch, so the runner can hold the arm
+reset_at() {
+    local t
+    t=$(printf '%s' "$1" | grep -o 'try again at [^."]*' | head -1 \
+        | sed 's/^try again at //; s/\([0-9]\)\(st\|nd\|rd\|th\),/\1,/')
+    [ -n "$t" ] && date -u -d "$t" +%s 2>/dev/null
+}
 
 while :; do
     left=$(( GR_END - $(now) ))
@@ -28,6 +35,7 @@ while :; do
     errtxt=$(grep -hE '"type":"(error|turn.failed)"' "$TMP/s.jsonl" | tail -3; tail -5 "$TMP/s.err")
     if [ "$ncmd" -eq 0 ] && printf '%s' "$errtxt" | grep -qiE "$LIMIT_RE"; then
         outcome=exhausted; detail=$(printf '%s' "$errtxt" | grep -iE "$LIMIT_RE" | head -1 | tr -d '\t' | head -c 200)
+        reset=$(reset_at "$errtxt")
         errors=$(( errors + 1 )); break
     fi
     if [ "$ncmd" -eq 0 ] && printf '%s' "$errtxt" | grep -qE "$AUTH_RE"; then
@@ -37,6 +45,7 @@ while :; do
     if printf '%s' "$errtxt" | grep -qiE "$LIMIT_RE"; then
         # limit hit mid-session after real play: stop here, the runner falls back
         outcome=exhausted; detail="mid-window: $(printf '%s' "$errtxt" | grep -iE "$LIMIT_RE" | head -1 | tr -d '\t' | head -c 160)"
+        reset=$(reset_at "$errtxt")
         break
     fi
     if [ "$dur" -lt 90 ] || [ "$ncmd" -eq 0 ]; then
@@ -54,6 +63,6 @@ while :; do
         fails=0; short=0; sleep 5
     fi
 done
-printf 'outcome=%s\tsessions=%s\tstalls=%s\terrors=%s\tdetail=%s\n' \
-    "$outcome" "$sessions" "$stalls" "$errors" "$detail" > "$RES"
+printf 'outcome=%s\tsessions=%s\tstalls=%s\terrors=%s\treset=%s\tdetail=%s\n' \
+    "$outcome" "$sessions" "$stalls" "$errors" "$reset" "$detail" > "$RES"
 case "$outcome" in played) exit 0 ;; exhausted) exit 3 ;; *) exit 4 ;; esac

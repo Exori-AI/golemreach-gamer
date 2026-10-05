@@ -30,6 +30,15 @@ CODEX_MODE="${GAMER_CODEX:-on}"
 CODEX_MODEL_NAME="${GAMER_CODEX_MODEL:-gpt-5.6-terra}"
 CODEX_Q="$WS/.codex"
 CODEX_PICKUP_SECONDS="${GAMER_CODEX_PICKUP_SECONDS:-150}"
+# A usage limit that names its reset time ("try again at ...") holds the Codex
+# arm until then, so windows don't spin up a container only to be refused.
+CODEX_HOLD="$WS/.codex-hold-until"
+# Model order alternates per window (odd: Codex first, even: free first), so
+# neither arm always gets the fresh character and start-of-window conditions.
+FREE_FIRST_SECONDS="${GAMER_FREE_FIRST_SECONDS:-$(( WINDOW_SECONDS / 2 ))}"
+# Free arm: slot i plays on model i mod n of this list, so one overloaded NIM
+# model doesn't rate-limit the whole party at once.
+FREE_MODELS="${GAMER_FREE_MODELS:-nvidia/nemotron-3-super-120b-a12b nvidia/nemotron-3.5-lightning-30b-a3b}"
 
 # Nth slot in GAMER_SLOTS reads GAMERn_API_KEY (Bearer token) and
 # GAMERn_CHARACTER_ID; playstyle comes from gamer/strategy-<slot>.md.
@@ -190,7 +199,13 @@ Append a 3-6 line dated entry to $dir/SESSION_LOG.md. Keep only what changes fut
     log "slot $slot: coach FAILED to write notebooks after 2 attempts — continuing"
 }
 
-free_model() { sed -n '/^model:/,/^[^ ]/s/^  default: *//p' "$HERMES_DIR/config.yaml" 2>/dev/null | head -1; }
+free_model() {   # free_model <slot> -> the NIM model this slot plays on
+    local i=0 s
+    for s in $SLOTS; do [ "$s" = "$1" ] && break; i=$(( i + 1 )); done
+    printf '%s\n' "$FREE_MODELS" | awk -v i="$i" '{print $(i % NF + 1)}'
+}
+
+codex_held() { [ "$(cat "$CODEX_HOLD" 2>/dev/null || echo 0)" -gt "$(date +%s)" ] 2>/dev/null; }
 
 xp_of() {   # xp_of <status json> -> "level experience"
     printf '%s' "$1" | python3 -c 'import json,sys
@@ -237,6 +252,65 @@ codex_window() {
     rm -f "$CODEX_Q/$slot.req" "$CODEX_Q/$slot.cancel" "$CODEX_Q/$slot.taken"
 }
 
+# codex_segment <slot> <end> <note>: one Codex segment, logged as a model row
+codex_segment() {
+    local slot="$1" end="$2" dir="$WS/$1" t0 before after res r
+    t0=$(date +%s); before=$(python3 /gamer/gr.py status 2>&1)
+    codex_window "$slot" "$end"
+    [ "$CODEX_STATE" = off ] && return
+    after=$(python3 /gamer/gr.py status 2>&1)
+    res=$(cat "$dir/.codex-result" 2>/dev/null)
+    log "slot $slot: codex segment ended: $CODEX_STATE ${res:+— $res}"
+    if [ -n "$res" ]; then
+        model_row "$slot" "codex:$CODEX_MODEL_NAME" "$t0" "$(date +%s)" "$before" "$after" \
+            "$(printf '%s' "$res" | sed -n 's/.*sessions=\([0-9]*\).*/\1/p')" \
+            "$(printf '%s' "$res" | sed -n 's/.*stalls=\([0-9]*\).*/\1/p')" \
+            "$(printf '%s' "$res" | sed -n 's/.*errors=\([0-9]*\).*/\1/p')" "$3 $CODEX_STATE ${res##*detail=}"
+        r=$(printf '%s' "$res" | sed -n 's/.*\treset=\([0-9]*\).*/\1/p')
+        if [ -n "$r" ] && [ "$r" -gt "$(date +%s)" ]; then
+            echo "$r" > "$CODEX_HOLD"
+            log "slot $slot: codex usage limit resets $(date -u -d "@$r" '+%F %T') UTC — codex arm held until then"
+        fi
+    else
+        model_row "$slot" "codex:$CODEX_MODEL_NAME" "$t0" "$(date +%s)" "$before" "$after" 0 0 1 "$3 $CODEX_STATE"
+    fi
+}
+
+# free_segment <slot> <until> <model> <note>: hermes sessions on the free model
+free_segment() {
+    local slot="$1" until="$2" model="$3" dir="$WS/$1" t0 before after out rc left t1 \
+        sessions=0 stalls=0 errors=0
+    [ $(( until - $(date +%s) )) -lt 120 ] && return
+    t0=$(date +%s); before=$(python3 /gamer/gr.py status 2>&1)
+    while [ "$(date +%s)" -lt "$until" ]; do
+        left=$(( until - $(date +%s) ))
+        [ "$left" -lt 120 ] && break
+        log "slot $slot: hermes play session on $model (${left}s left in segment)"
+        t1=$(date +%s)
+        out=$(timeout "$left" hermes -m "$model" -z "$(build_prompt "$slot")" 2>&1)
+        rc=$?
+        sessions=$(( sessions + 1 ))
+        [ $(( $(date +%s) - t1 )) -lt 90 ] && stalls=$(( stalls + 1 ))
+        printf '%s\n' "$out" | tail -n 20 | sed "s/^/[$slot] /"
+        printf '%s\n' "$out" > "$dir/LAST_SESSION_OUTPUT.txt"
+        { printf '\n===== %s session %s (exit %s, %s) =====\n' "$slot" "$(date -u '+%F %T')" "$rc" "$model"; printf '%s\n' "$out"; } >> "$dir/SESSION_OUTPUT_ARCHIVE.txt"
+        capture_transcript "$slot"
+        if printf '%s' "$out" | grep -qE "HTTP 429|Too Many Requests|rate limit"; then
+            errors=$(( errors + 1 ))
+            # jittered, so concurrent slots don't retry in lockstep
+            local backoff=$(( 120 + RANDOM % 180 ))
+            log "slot $slot: session ended (exit $rc) on a rate limit — backing off ${backoff}s"
+            sleep "$backoff"
+        else
+            log "slot $slot: session ended (exit $rc) — continuing in 5s"
+            sleep 5
+        fi
+    done
+    [ "$sessions" -gt 0 ] || return
+    after=$(python3 /gamer/gr.py status 2>&1)
+    model_row "$slot" "free:$model" "$t0" "$(date +%s)" "$before" "$after" "$sessions" "$stalls" "$errors" "$4"
+}
+
 play_window() {
     local slot="$1" dir="$WS/$1"
     mkdir -p "$dir"
@@ -255,58 +329,26 @@ play_window() {
     before=$(python3 /gamer/gr.py status 2>&1)
     log "slot $slot: window open until $(date -u -d "@$end" '+%T') UTC — $before"
 
-    local seg_t0 seg_before seg_after res sessions=0 stalls=0 errors=0 t1
-    seg_t0=$(date +%s); seg_before="$before"
-    codex_window "$slot" "$end"
-    if [ "$CODEX_STATE" != off ]; then
-        seg_after=$(python3 /gamer/gr.py status 2>&1)
-        res=$(cat "$dir/.codex-result" 2>/dev/null)
-        log "slot $slot: codex segment ended: $CODEX_STATE ${res:+— $res}"
-        if [ -n "$res" ]; then
-            model_row "$slot" "codex:$CODEX_MODEL_NAME" "$seg_t0" "$(date +%s)" "$seg_before" "$seg_after" \
-                "$(printf '%s' "$res" | sed -n 's/.*sessions=\([0-9]*\).*/\1/p')" \
-                "$(printf '%s' "$res" | sed -n 's/.*stalls=\([0-9]*\).*/\1/p')" \
-                "$(printf '%s' "$res" | sed -n 's/.*errors=\([0-9]*\).*/\1/p')" "$CODEX_STATE ${res##*detail=}"
-        else
-            model_row "$slot" "codex:$CODEX_MODEL_NAME" "$seg_t0" "$(date +%s)" "$seg_before" "$seg_after" 0 0 1 "$CODEX_STATE"
-        fi
-        seg_before="$seg_after"
-        [ "$(( end - $(date +%s) ))" -ge 120 ] && log "slot $slot: free model ($(free_model)) plays the rest of the window"
-    fi
-    seg_t0=$(date +%s)
-
-    while [ "$(date +%s)" -lt "$end" ]; do
-        left=$(( end - $(date +%s) ))
-        [ "$left" -lt 120 ] && break
-        log "slot $slot: hermes play session (${left}s left in window)"
-        t1=$(date +%s)
-        out=$(timeout "$left" hermes -z "$(build_prompt "$slot")" 2>&1)
-        rc=$?
-        sessions=$(( sessions + 1 ))
-        [ $(( $(date +%s) - t1 )) -lt 90 ] && stalls=$(( stalls + 1 ))
-        printf '%s\n' "$out" | tail -n 20 | sed "s/^/[$slot] /"
-        printf '%s\n' "$out" > "$dir/LAST_SESSION_OUTPUT.txt"
-        { printf '\n===== %s session %s (exit %s) =====\n' "$slot" "$(date -u '+%F %T')" "$rc"; printf '%s\n' "$out"; } >> "$dir/SESSION_OUTPUT_ARCHIVE.txt"
-        capture_transcript "$slot"
-        if printf '%s' "$out" | grep -qE "HTTP 429|Too Many Requests|rate limit"; then
-            errors=$(( errors + 1 ))
-            # jittered, so concurrent slots don't retry the shared key in lockstep
-            local backoff=$(( 120 + RANDOM % 180 ))
-            log "slot $slot: session ended (exit $rc) on a rate limit — backing off ${backoff}s"
-            sleep "$backoff"
-        else
-            log "slot $slot: session ended (exit $rc) — continuing window in 5s"
-            sleep 5
-        fi
-    done
-    if [ "$sessions" -gt 0 ]; then
-        seg_after=$(python3 /gamer/gr.py status 2>&1)
-        model_row "$slot" "free:$(free_model)" "$seg_t0" "$(date +%s)" "$seg_before" "$seg_after" \
-            "$sessions" "$stalls" "$errors" "${CODEX_STATE:+after codex=$CODEX_STATE}"
-    fi
+    local win order fm
+    win=$(( $(cat "$dir/.window-n" 2>/dev/null || echo 0) + 1 )); echo "$win" > "$dir/.window-n"
+    fm=$(free_model "$slot")
+    if [ "$CODEX_MODE" != on ]; then order=free-only
+    elif codex_held; then order=codex-held
+    elif [ $(( win % 2 )) -eq 1 ]; then order=codex-first
+    else order=free-first; fi
+    log "slot $slot: window $win, order $order, free model $fm"
+    CODEX_STATE=off
+    case "$order" in
+        codex-first) codex_segment "$slot" "$end" "win=$win order=$order pos=1" ;;
+        free-first)  free_segment "$slot" $(( start + FREE_FIRST_SECONDS )) "$fm" "win=$win order=$order pos=1"
+                     codex_segment "$slot" "$end" "win=$win order=$order pos=2" ;;
+    esac
+    local note="win=$win order=$order pos=last"
+    [ "$CODEX_STATE" = off ] || note="$note after codex=$CODEX_STATE"
+    free_segment "$slot" "$end" "$fm" "$note"
 
     log "slot $slot: window over — wrap-up session (walk to safety, log)"
-    out=$(timeout "$WRAPUP_SECONDS" hermes -z "$(wrapup_prompt "$slot")" 2>&1)
+    out=$(timeout "$WRAPUP_SECONDS" hermes -m "$(free_model "$slot")" -z "$(wrapup_prompt "$slot")" 2>&1)
     printf '%s\n' "$out" | tail -n 5 | sed "s/^/[$slot] /"
     capture_transcript "$slot"
     after=$(python3 /gamer/gr.py status 2>&1)
@@ -350,7 +392,7 @@ hermes config set memory.memory_enabled false >/dev/null 2>&1 \
 
 # hermes tries these on a 429/overload before a session gives up. Keep them to
 # models NIM still serves (dead ids return 410 and waste the retry).
-FALLBACK_MODELS="${GAMER_FALLBACK_MODELS:-nvidia/nemotron-3-super-120b-a12b z-ai/glm-5.3-flash}"
+FALLBACK_MODELS="${GAMER_FALLBACK_MODELS:-nvidia/nemotron-3.5-lightning-30b-a3b nvidia/nemotron-3-super-120b-a12b moonshotai/kimi-k3}"
 FALLBACK_MODELS="$FALLBACK_MODELS" python3 - "$HERMES_DIR/config.yaml" <<'PY' \
     && log "hermes fallback chain: $FALLBACK_MODELS" || log "WARNING: could not set hermes fallback chain"
 import os, re, sys
