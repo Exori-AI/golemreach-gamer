@@ -39,6 +39,9 @@ FREE_FIRST_SECONDS="${GAMER_FREE_FIRST_SECONDS:-$(( WINDOW_SECONDS / 2 ))}"
 # Free arm: slot i plays on model i mod n of this list, so one overloaded NIM
 # model doesn't rate-limit the whole party at once.
 FREE_MODELS="${GAMER_FREE_MODELS:-nvidia/nemotron-3-super-120b-a12b nvidia/nemotron-3.5-lightning-30b-a3b}"
+# Each death costs 10% xp; after this many in one window the character rests
+# instead of feeding a death spiral (0 = never stop).
+DEATH_STOP="${GAMER_DEATH_STOP:-3}"
 
 # Nth slot in GAMER_SLOTS reads GAMERn_API_KEY (Bearer token) and
 # GAMERn_CHARACTER_ID; playstyle comes from gamer/strategy-<slot>.md.
@@ -205,6 +208,8 @@ free_model() {   # free_model <slot> -> the NIM model this slot plays on
     printf '%s\n' "$FREE_MODELS" | awk -v i="$i" '{print $(i % NF + 1)}'
 }
 
+window_deaths() { awk -F'\t' -v a="$WIN_START" '$1>=a' "$WS/$1/DEATHS.tsv" 2>/dev/null | wc -l; }
+
 codex_held() { [ "$(cat "$CODEX_HOLD" 2>/dev/null || echo 0)" -gt "$(date +%s)" ] 2>/dev/null; }
 
 xp_of() {   # xp_of <status json> -> "level experience"
@@ -285,6 +290,10 @@ free_segment() {
     while [ "$(date +%s)" -lt "$until" ]; do
         left=$(( until - $(date +%s) ))
         [ "$left" -lt 120 ] && break
+        if [ "$DEATH_STOP" -gt 0 ] && [ "$(window_deaths "$slot")" -ge "$DEATH_STOP" ]; then
+            log "slot $slot: $(window_deaths "$slot") deaths this window — stopping play early"
+            break
+        fi
         log "slot $slot: hermes play session on $model (${left}s left in segment)"
         t1=$(date +%s)
         out=$(timeout "$left" hermes -m "$model" -z "$(build_prompt "$slot")" 2>&1)
@@ -320,6 +329,7 @@ play_window() {
     local out rc left start end before after
     start=$(date +%s)
     end=$(( start + WINDOW_SECONDS ))
+    WIN_START=$start
     : > "$dir/WINDOW_TRANSCRIPT.txt"
     out=$(python3 /gamer/gr.py enter "$GR_CHARACTER" 2>&1 | head -3)
     case "$out" in

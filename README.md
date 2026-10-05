@@ -45,6 +45,7 @@ GAMER_BASE_URL=https://play.golemreach.com
 GAMER_SLOTS=vallum adori favilla silva
 GAMER_CODEX=on            # off = free model only
 GAMER_FREE_MODELS=...     # optional: NVIDIA model ids the slots take in turn
+GAMER_DEATH_STOP=3        # end a window early after this many deaths (0 = never)
 GAMER1_API_KEY=...        GAMER1_CHARACTER_ID=...
 ...                       (one GAMERn_ pair per slot, in GAMER_SLOTS order)
 ```
