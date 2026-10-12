@@ -33,6 +33,7 @@ CODEX_PICKUP_SECONDS="${GAMER_CODEX_PICKUP_SECONDS:-150}"
 # A usage limit that names its reset time ("try again at ...") holds the Codex
 # arm until then, so windows don't spin up a container only to be refused.
 CODEX_HOLD="$WS/.codex-hold-until"
+CODEX_AUTH_HOLD="${GAMER_CODEX_AUTH_HOLD:-21600}"   # hold after a rejected codex login (6h)
 # Model order alternates per window (odd: Codex first, even: free first), so
 # neither arm always gets the fresh character and start-of-window conditions.
 FREE_FIRST_SECONDS="${GAMER_FREE_FIRST_SECONDS:-$(( WINDOW_SECONDS / 2 ))}"
@@ -275,6 +276,9 @@ codex_segment() {
         if [ -n "$r" ] && [ "$r" -gt "$(date +%s)" ]; then
             echo "$r" > "$CODEX_HOLD"
             log "slot $slot: codex usage limit resets $(date -u -d "@$r" '+%F %T') UTC — codex arm held until then"
+        elif printf '%s' "$res" | grep -q 'detail=auth:'; then
+            echo $(( $(date +%s) + CODEX_AUTH_HOLD )) > "$CODEX_HOLD"   # dead login: retry rarely, not every window
+            log "slot $slot: codex login rejected — codex arm held $(( CODEX_AUTH_HOLD / 3600 ))h (needs a fresh codex login on the host)"
         fi
     else
         model_row "$slot" "codex:$CODEX_MODEL_NAME" "$t0" "$(date +%s)" "$before" "$after" 0 0 1 "$3 $CODEX_STATE"
@@ -361,6 +365,8 @@ play_window() {
     out=$(timeout "$WRAPUP_SECONDS" hermes -m "$(free_model "$slot")" -z "$(wrapup_prompt "$slot")" 2>&1)
     printf '%s\n' "$out" | tail -n 5 | sed "s/^/[$slot] /"
     capture_transcript "$slot"
+    # the model may leave it at a spawn; deaths in the ~10 min idle-out were never logged
+    log "slot $slot: $(python3 /gamer/gr.py home 240 2>&1 | tail -1)"
     after=$(python3 /gamer/gr.py status 2>&1)
     log "slot $slot: window closed — before $before | after $after"
     printf 'window %s -> %s UTC\nbefore: %s\nafter:  %s\n' \

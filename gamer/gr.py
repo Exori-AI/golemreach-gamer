@@ -15,6 +15,7 @@ Auth: GR_TOKEN env var (Bearer). Base: GR_BASE (default https://play.golemreach.
   gr.py guild                     Lantern Guild board
   gr.py enter CHARACTER_ID        enter the world
   gr.py status                    one-line JSON: level/xp/hp/stamina (runner use)
+  gr.py home [SECS]               walk to the temple protection zone and wait there (runner use)
   gr.py feedback '<answers json>' answer the level 5/8/10 survey (published publicly)
 """
 import json, os, re, sys, time, urllib.request, urllib.error
@@ -159,6 +160,29 @@ def status():
     s = o.get("self") or {}
     print(json.dumps({k: s.get(k) for k in ("name", "level", "experience", "health", "maxHealth",
                                             "stamina", "hungry", "position")}))
+
+
+HOME = tuple(int(v) for v in os.environ.get("GR_HOME", "497,492,0").split(","))   # Efidia temple (P zone)
+
+
+def home(secs):
+    """End-of-window safety: there is no logout, the character lingers ~10 min after its
+    last action. Walk it into the temple protection zone, where monsters cannot enter."""
+    deadline = time.time() + secs
+    target = {"x": HOME[0], "y": HOME[1], "z": HOME[2]}
+    sent = 0
+    while time.time() < deadline:
+        s = (obs_of(observe()).get("self") or {})
+        p = s.get("position") or {}
+        if not p:
+            print("HOME offline/unknown"); return 1
+        if p.get("z") == HOME[2] and abs(p.get("x", 0) - HOME[0]) <= 2 and abs(p.get("y", 0) - HOME[1]) <= 2:
+            print(f"HOME ok @ {pos(p)}"); return 0
+        if sent == 0 or not s.get("busy"):   # walk stopped early (blocked, attacked): re-issue
+            act({"type": "walk_to", "target": target, "stopDistance": 1, "avoidCreatures": True})
+            sent += 1
+        time.sleep(4)
+    print(f"HOME timeout @ {pos(p)} after {sent} walk_to"); return 1
 
 
 CORPSE = re.compile(r"[Ll]oot is in the corpse at (\d+),\s*(\d+)")
@@ -313,6 +337,8 @@ def main(argv):
         print(("ENTER error " + json.dumps(r)[:400]) if r.get("httpError") else compact(obs_of(r)))
     elif cmd == "status":
         status()
+    elif cmd == "home":
+        return home(int(argv[1]) if len(argv) > 1 else 240)
     elif cmd == "feedback":
         a = json.loads(argv[1])
         print(json.dumps(call("POST", "/v1/feedback", {"answers": a.get("answers", a)}))[:800])
