@@ -14,6 +14,12 @@ WS=/home/hermes/workspace
 BASE="${GAMER_BASE_URL:-https://play.golemreach.com}"
 WINDOW_SECONDS="${PLAY_WINDOW_SECONDS:-7200}"     # 2h online per window
 REST_SECONDS="${REST_SECONDS:-21600}"             # 6h offline -> +120 stamina, matches the 2h drain
+# A fixed rest only holds stamina where it is. Kill xp is halved at <=840, and
+# by mid-October every window started near 116 and drained to ~0. So the rest
+# runs until the next window can start above the floor plus one window's drain
+# and one death (-60), capped at REST_MAX.
+STAMINA_FLOOR="${GAMER_STAMINA_FLOOR:-840}"
+REST_MAX="${GAMER_REST_MAX_SECONDS:-259200}"       # 72h
 WRAPUP_SECONDS="${WRAPUP_SECONDS:-600}"
 COACH_MODEL="${COACH_MODEL:-nvidia/nemotron-3-super-120b-a12b}"
 COACH_TIMEOUT="${COACH_TIMEOUT:-900}"
@@ -216,6 +222,22 @@ window_deaths() { awk -F'\t' -v a="$WIN_START" '$1>=a' "$WS/$1/DEATHS.tsv" 2>/de
 
 codex_held() { [ "$(cat "$CODEX_HOLD" 2>/dev/null || echo 0)" -gt "$(date +%s)" ] 2>/dev/null; }
 
+stamina_of() {   # stamina_of <status json> -> stamina or ?
+    printf '%s' "$1" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("stamina","?"))
+except Exception: print("?")' 2>/dev/null
+}
+
+rest_for() {   # rest_for <stamina> -> seconds offline before the next window
+    local st="$1" need r
+    case "$st" in ''|*[!0-9]*) echo "$REST_SECONDS"; return ;; esac
+    need=$(( STAMINA_FLOOR + WINDOW_SECONDS / 60 + 60 ))
+    r=$(( (need - st) * 180 + 600 ))   # +1 per 3 min offline, after a ~10 min idle-out
+    [ "$r" -lt "$REST_SECONDS" ] && r=$REST_SECONDS
+    [ "$r" -gt "$REST_MAX" ] && r=$REST_MAX
+    echo "$r"
+}
+
 xp_of() {   # xp_of <status json> -> "level experience"
     printf '%s' "$1" | python3 -c 'import json,sys
 try: d=json.load(sys.stdin); print(d.get("level","?"), d.get("experience","?"))
@@ -230,7 +252,7 @@ model_row() {   # slot model t0 t1 before after sessions stalls errors note
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$GR_CHARACTER" "$2" \
         "$(date -u -d "@$3" '+%FT%TZ')" "$(date -u -d "@$4" '+%FT%TZ')" "$(( ($4 - $3 + 30) / 60 ))" \
         "$(xp_of "$5" | tr ' ' '\t')" "$(xp_of "$6" | tr ' ' '\t')" "$deaths" "$7" "$8" "$9" \
-        "$(printf '%s' "${10}" | tr '\t\n' '  ' | head -c 200)" >> "$f"
+        "$(printf '%s st=%s>%s' "${10}" "$(stamina_of "$5")" "$(stamina_of "$6")" | tr '\t\n' '  ' | head -c 200)" >> "$f"
 }
 
 # codex_window <slot> <end>: blocks while Codex plays; sets CODEX_STATE
@@ -377,8 +399,9 @@ play_window() {
     printf 'window %s -> %s UTC\nbefore: %s\nafter:  %s\n' \
         "$(date -u -d "@$start" '+%F %T')" "$(date -u '+%F %T')" "$before" "$after" > "$dir/WINDOW_STATS.txt"
     # no logout endpoint: the character idles out ~10 min after its last action.
-    echo $(( $(date +%s) + REST_SECONDS )) > "$(state_file "$slot")"
-    log "slot $slot: resting for stamina until $(date -u -d "@$(read_state "$slot")" '+%F %T') UTC"
+    local st; st=$(stamina_of "$after")
+    echo $(( $(date +%s) + $(rest_for "$st") )) > "$(state_file "$slot")"
+    log "slot $slot: stamina $st — resting until $(date -u -d "@$(read_state "$slot")" '+%F %T') UTC"
     unset GR_TOKEN
     run_coach "$slot"
     rotate_logs "$dir"
@@ -412,8 +435,9 @@ hermes config set memory.memory_enabled false >/dev/null 2>&1 \
     || log "WARNING: could not disable hermes shared memory"
 
 # hermes tries these on a 429/overload before a session gives up. Keep them to
-# models NIM still serves (dead ids return 410 and waste the retry).
-FALLBACK_MODELS="${GAMER_FALLBACK_MODELS:-nvidia/nemotron-3.5-lightning-30b-a3b nvidia/nemotron-3-super-120b-a12b moonshotai/kimi-k3}"
+# models NIM still serves (dead ids return 410 and waste the retry; kimi-k3
+# reached end of life 2026-10-15).
+FALLBACK_MODELS="${GAMER_FALLBACK_MODELS:-nvidia/nemotron-3.5-lightning-30b-a3b nvidia/nemotron-3-super-120b-a12b}"
 FALLBACK_MODELS="$FALLBACK_MODELS" python3 - "$HERMES_DIR/config.yaml" <<'PY' \
     && log "hermes fallback chain: $FALLBACK_MODELS" || log "WARNING: could not set hermes fallback chain"
 import os, re, sys
