@@ -400,6 +400,10 @@ play_window() {
         "$(date -u -d "@$start" '+%F %T')" "$(date -u '+%F %T')" "$before" "$after" > "$dir/WINDOW_STATS.txt"
     # no logout endpoint: the character idles out ~10 min after its last action.
     local st; st=$(stamina_of "$after")
+    case "$st" in ''|*[!0-9]*)   # offline at close: estimate from the start minus the drain
+        st=$(stamina_of "$before")
+        case "$st" in ''|*[!0-9]*) ;; *) st=$(( st - ($(date +%s) - start) / 60 )); [ "$st" -lt 0 ] && st=0 ;; esac ;;
+    esac
     echo $(( $(date +%s) + $(rest_for "$st") )) > "$(state_file "$slot")"
     log "slot $slot: stamina $st — resting until $(date -u -d "@$(read_state "$slot")" '+%F %T') UTC"
     unset GR_TOKEN
