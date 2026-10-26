@@ -21,7 +21,7 @@ REST_SECONDS="${REST_SECONDS:-21600}"             # 6h offline -> +120 stamina, 
 STAMINA_FLOOR="${GAMER_STAMINA_FLOOR:-840}"
 REST_MAX="${GAMER_REST_MAX_SECONDS:-259200}"       # 72h
 WRAPUP_SECONDS="${WRAPUP_SECONDS:-600}"
-COACH_MODEL="${COACH_MODEL:-nvidia/nemotron-3-super-120b-a12b}"
+COACH_MODEL="${COACH_MODEL:-nvidia/nemotron-3.5-super-vl-120b-a12b}"
 COACH_TIMEOUT="${COACH_TIMEOUT:-900}"
 PLAY_MAX_TURNS="${PLAY_MAX_TURNS:-300}"
 # ~3.5 model calls/min per live session; 4 fit the free tier's rate limit.
@@ -46,11 +46,18 @@ FREE_FIRST_SECONDS="${GAMER_FREE_FIRST_SECONDS:-$(( WINDOW_SECONDS / 2 ))}"
 # Free arm: slot i plays on model i mod n of this list. Super only since 10-12:
 # on lightning, Adori and Silva made 0 and 7 xp/h (super: 79 and 31). Adori's model
 # decided its character did not exist and registered a new account.
-# Lightning stays in the fallback chain.
-FREE_MODELS="${GAMER_FREE_MODELS:-nvidia/nemotron-3-super-120b-a12b}"
+# nemotron-3-super returns 404 for our key since 2026-10-20 (4,495 dead sessions);
+# 3.5-super-vl is the same size class and passed a tool-call probe on 10-26.
+FREE_MODELS="${GAMER_FREE_MODELS:-nvidia/nemotron-3.5-super-vl-120b-a12b}"
 # Each death costs 10% xp; after this many in one window the character rests
 # instead of feeding a death spiral (0 = never stop).
 DEATH_STOP="${GAMER_DEATH_STOP:-3}"
+# Three strikes: after this many sessions in a row end on the same non-rate-limit error
+# (e.g. a model id NIM no longer serves), the slot stops and holds instead of
+# retrying every 5s. The hold doubles per consecutive tripped window.
+BREAKER_AFTER="${GAMER_BREAKER_AFTER:-3}"
+BREAKER_HOLD="${GAMER_BREAKER_HOLD_SECONDS:-21600}"   # 6h
+BREAKER=0
 
 # Nth slot in GAMER_SLOTS reads GAMERn_API_KEY (Bearer token) and
 # GAMERn_CHARACTER_ID; playstyle comes from gamer/strategy-<slot>.md.
@@ -142,6 +149,25 @@ rotate_logs() {
     if [ -f "$dir/SESSION_OUTPUT_ARCHIVE.txt" ] && [ "$(wc -l < "$dir/SESSION_OUTPUT_ARCHIVE.txt")" -gt 2000 ]; then
         tail -n 2000 "$dir/SESSION_OUTPUT_ARCHIVE.txt" > "$dir/soa.tmp" && mv "$dir/soa.tmp" "$dir/SESSION_OUTPUT_ARCHIVE.txt"
     fi
+}
+
+# Models wrote 35 scripts (10-06..10-23) that POST /v1/register or create
+# characters, and saved tokens next to them. One account per character is the
+# rule: delete such scripts and stray token files after every window.
+sweep_register_scripts() {
+    local slot="$1" f n=0
+    for f in $(find "$WS" -maxdepth 2 -path "$WS/_*" -prune -o -type f \
+            \( -name '*.py' -o -name '*.sh' -o -name '*.js' \) -print 2>/dev/null) \
+            $(find "$HOME" -maxdepth 1 -type f \( -name '*.py' -o -name '*.sh' -o -name '*.js' \) 2>/dev/null); do
+        if grep -q '/v1/register' "$f" || { grep -qE "/v1/characters([\"' ]|$)" "$f" && grep -qi post "$f"; }; then
+            rm -f "$f"; n=$(( n + 1 ))
+        fi
+    done
+    for f in $(find "$WS" -maxdepth 2 -path "$WS/_*" -prune -o -type f \( -name 'gr_token*' -o -name '.gr_token*' \) -print 2>/dev/null); do
+        rm -f "$f"; n=$(( n + 1 ))
+    done
+    [ "$n" -gt 0 ] && log "slot $slot: removed $n register script(s) / stray token file(s) from the workspace"
+    return 0
 }
 
 # hermes -z prints only the final message; the real play (tool calls, views)
@@ -313,7 +339,8 @@ codex_segment() {
 # free_segment <slot> <until> <model> <note>: hermes sessions on the free model
 free_segment() {
     local slot="$1" until="$2" model="$3" dir="$WS/$1" t0 before after out rc left t1 \
-        sessions=0 stalls=0 errors=0
+        sessions=0 stalls=0 errors=0 sig last_sig="" same=0
+    [ "$BREAKER" = 1 ] && return
     [ $(( until - $(date +%s) )) -lt 120 ] && return
     t0=$(date +%s); before=$(python3 /gamer/gr.py status 2>&1)
     while [ "$(date +%s)" -lt "$until" ]; do
@@ -334,19 +361,35 @@ free_segment() {
         { printf '\n===== %s session %s (exit %s, %s) =====\n' "$slot" "$(date -u '+%F %T')" "$rc" "$model"; printf '%s\n' "$out"; } >> "$dir/SESSION_OUTPUT_ARCHIVE.txt"
         capture_transcript "$slot"
         if printf '%s' "$out" | grep -qE "HTTP 429|Too Many Requests|rate limit"; then
-            errors=$(( errors + 1 ))
+            errors=$(( errors + 1 )); same=0; last_sig=""
             # jittered, so concurrent slots don't retry in lockstep
             local backoff=$(( 120 + RANDOM % 180 ))
             log "slot $slot: session ended (exit $rc) on a rate limit — backing off ${backoff}s"
             sleep "$backoff"
         else
+            # error signature: the last API/HTTP error line, ids masked
+            sig=$(printf '%s\n' "$out" | tail -n 5 | grep -E "API call failed|Error code|HTTP [45][0-9][0-9]" \
+                | tail -n 1 | sed -E 's/[0-9a-fA-F-]{8,}/#/g' | cut -c1-300)
+            if [ -n "$sig" ]; then
+                errors=$(( errors + 1 ))
+                if [ "$sig" = "$last_sig" ]; then same=$(( same + 1 )); else same=1; last_sig="$sig"; fi
+            else
+                same=0; last_sig=""
+            fi
+            if [ "$BREAKER_AFTER" -gt 0 ] && [ "$same" -ge "$BREAKER_AFTER" ]; then
+                BREAKER=1
+                log "slot $slot: BREAKER — $same sessions in a row ended on: $sig"
+                printf '%s\t%s\t%s\t%s\n' "$(date -u '+%FT%TZ')" "$slot" "$model" "$sig" >> "$WS/BREAKER.tsv"
+                break
+            fi
             log "slot $slot: session ended (exit $rc) — continuing in 5s"
             sleep 5
         fi
     done
     [ "$sessions" -gt 0 ] || return
     after=$(python3 /gamer/gr.py status 2>&1)
-    model_row "$slot" "free:$model" "$t0" "$(date +%s)" "$before" "$after" "$sessions" "$stalls" "$errors" "$4"
+    local note="$4"; [ "$BREAKER" = 1 ] && note="$note BREAKER"
+    model_row "$slot" "free:$model" "$t0" "$(date +%s)" "$before" "$after" "$sessions" "$stalls" "$errors" "$note"
 }
 
 play_window() {
@@ -359,6 +402,7 @@ play_window() {
     start=$(date +%s)
     end=$(( start + WINDOW_SECONDS ))
     WIN_START=$start
+    BREAKER=0
     : > "$dir/WINDOW_TRANSCRIPT.txt"
     out=$(python3 /gamer/gr.py enter "$GR_CHARACTER" 2>&1 | head -3)
     case "$out" in
@@ -386,14 +430,19 @@ play_window() {
     [ "$CODEX_STATE" = off ] || note="$note after codex=$CODEX_STATE"
     free_segment "$slot" "$end" "$fm" "$note"
 
-    log "slot $slot: window over — wrap-up session (walk to safety, log)"
-    out=$(timeout "$WRAPUP_SECONDS" hermes -m "$(free_model "$slot")" -z "$(wrapup_prompt "$slot")" 2>&1)
-    printf '%s\n' "$out" | tail -n 5 | sed "s/^/[$slot] /"
-    capture_transcript "$slot"
+    if [ "$BREAKER" = 1 ]; then
+        log "slot $slot: window cut short by the breaker — no wrap-up session"
+    else
+        log "slot $slot: window over — wrap-up session (walk to safety, log)"
+        out=$(timeout "$WRAPUP_SECONDS" hermes -m "$(free_model "$slot")" -z "$(wrapup_prompt "$slot")" 2>&1)
+        printf '%s\n' "$out" | tail -n 5 | sed "s/^/[$slot] /"
+        capture_transcript "$slot"
+    fi
     # the model may leave it at a spawn; deaths in the ~10 min idle-out were never logged
     log "slot $slot: $(python3 /gamer/gr.py home 240 2>&1 | tail -1)"
     # a confused model once registered a stray account and saved its token here
     [ -e "$HOME/.gr_token" ] && { rm -f "$HOME/.gr_token"; log "slot $slot: removed stray ~/.gr_token"; }
+    sweep_register_scripts "$slot"
     after=$(python3 /gamer/gr.py status 2>&1)
     log "slot $slot: window closed — before $before | after $after"
     printf 'window %s -> %s UTC\nbefore: %s\nafter:  %s\n' \
@@ -404,12 +453,24 @@ play_window() {
         st=$(stamina_of "$before")
         case "$st" in ''|*[!0-9]*) ;; *) st=$(( st - ($(date +%s) - start) / 60 )); [ "$st" -lt 0 ] && st=0 ;; esac ;;
     esac
-    echo $(( $(date +%s) + $(rest_for "$st") )) > "$(state_file "$slot")"
+    local rest; rest=$(rest_for "$st")
+    if [ "$BREAKER" = 1 ]; then
+        local trips hold; trips=$(( $(cat "$dir/.breaker-trips" 2>/dev/null || echo 0) + 1 ))
+        echo "$trips" > "$dir/.breaker-trips"
+        hold=$(( BREAKER_HOLD << (trips > 4 ? 4 : trips - 1) ))
+        [ "$hold" -gt "$REST_MAX" ] && hold=$REST_MAX
+        [ "$hold" -gt "$rest" ] && rest=$hold
+        log "slot $slot: breaker trip $trips in a row — slot held $(( rest / 3600 ))h (see $WS/BREAKER.tsv)"
+    else
+        rm -f "$dir/.breaker-trips"
+    fi
+    echo $(( $(date +%s) + rest )) > "$(state_file "$slot")"
     log "slot $slot: stamina $st — resting until $(date -u -d "@$(read_state "$slot")" '+%F %T') UTC"
     unset GR_TOKEN
-    run_coach "$slot"
+    [ "$BREAKER" = 1 ] || run_coach "$slot"
     rotate_logs "$dir"
-    hermes sessions prune --older-than 14 -y >/dev/null 2>&1
+    # sessions are copied into the notebooks; 14 days of them grew state.db to 1.5G
+    hermes sessions prune --older-than 5 -y >/dev/null 2>&1
 }
 
 # drop schedule files of slots that are not active, so nothing (e.g. the
@@ -439,9 +500,10 @@ hermes config set memory.memory_enabled false >/dev/null 2>&1 \
     || log "WARNING: could not disable hermes shared memory"
 
 # hermes tries these on a 429/overload before a session gives up. Keep them to
-# models NIM still serves (dead ids return 410 and waste the retry; kimi-k3
-# reached end of life 2026-10-15).
-FALLBACK_MODELS="${GAMER_FALLBACK_MODELS:-nvidia/nemotron-3.5-lightning-30b-a3b nvidia/nemotron-3-super-120b-a12b}"
+# models NIM still serves (dead ids return 410/404 and waste the retry; kimi-k3
+# reached end of life 2026-10-15, nemotron-3-super 404s since 2026-10-20).
+# Lightning is out: 0-7 xp/h when it played on 10-12.
+FALLBACK_MODELS="${GAMER_FALLBACK_MODELS:-nvidia/nemotron-3-ultra-550b-a55b minimaxai/minimax-m3.1-flash}"
 FALLBACK_MODELS="$FALLBACK_MODELS" python3 - "$HERMES_DIR/config.yaml" <<'PY' \
     && log "hermes fallback chain: $FALLBACK_MODELS" || log "WARNING: could not set hermes fallback chain"
 import os, re, sys
@@ -450,6 +512,22 @@ block = "fallback_providers:\n" + "".join(
     f"  - provider: nvidia\n    model: {m}\n" for m in os.environ["FALLBACK_MODELS"].split())
 s, n = re.subn(r"^fallback_providers:\n(?:[ -].*\n)*", block, s, flags=re.M)
 open(p, "w").write(s if n else s + block)
+PY
+
+# execute_code scrubs every env var whose name holds TOKEN, so sessions that
+# chose it over the terminal saw "GR_TOKEN not set", and some then wrote register
+# scripts (10-23 transcripts). terminal.env_passthrough lets the game vars
+# through; they are this lane's own keys, not hermes provider credentials.
+python3 - "$HERMES_DIR/config.yaml" <<'PY' \
+    && log "hermes env passthrough: GR_TOKEN GR_BASE GR_CHARACTER GR_EVENTS_FILE" \
+    || log "WARNING: could not set hermes env passthrough"
+import re, sys
+p = sys.argv[1]; s = open(p).read()
+block = "  env_passthrough:\n" + "".join(
+    f"  - {v}\n" for v in ("GR_TOKEN", "GR_BASE", "GR_CHARACTER", "GR_EVENTS_FILE"))
+s = re.sub(r"^  env_passthrough:.*\n(?:  - .*\n)*", "", s, flags=re.M)
+s, n = re.subn(r"^terminal:\n", "terminal:\n" + block, s, count=1, flags=re.M)
+open(p, "w").write(s if n else s + "terminal:\n" + block)
 PY
 
 playable() {
