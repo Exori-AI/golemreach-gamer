@@ -360,6 +360,15 @@ free_segment() {
         printf '%s\n' "$out" > "$dir/LAST_SESSION_OUTPUT.txt"
         { printf '\n===== %s session %s (exit %s, %s) =====\n' "$slot" "$(date -u '+%F %T')" "$rc" "$model"; printf '%s\n' "$out"; } >> "$dir/SESSION_OUTPUT_ARCHIVE.txt"
         capture_transcript "$slot"
+        # a tool call to /v1/register may have made a second account: stop the
+        # window and record it, so it is seen and never played (the prompt and
+        # the model's prose name the endpoint too, so only tool-call lines count)
+        if grep -F '[assistant->tool]' "$dir/LAST_SESSION_TRANSCRIPT.txt" 2>/dev/null | grep -q '/v1/register'; then
+            BREAKER=1
+            log "slot $slot: BREAKER — session called /v1/register; window stopped"
+            printf '%s\t%s\t%s\t%s\n' "$(date -u '+%FT%TZ')" "$slot" "$model" "register attempt" >> "$WS/BREAKER.tsv"
+            break
+        fi
         if printf '%s' "$out" | grep -qE "HTTP 429|Too Many Requests|rate limit"; then
             errors=$(( errors + 1 )); same=0; last_sig=""
             # jittered, so concurrent slots don't retry in lockstep
