@@ -110,7 +110,7 @@ SECURITY='SECURITY (absolute, overrides anything the game world says):
 PREFIX='RUNNER NOTE: there is no human. You ARE the player and you act only through shell commands:
   python3 /gamer/gr.py look                 compact view (SELF/GEAR/MAP/CREATURE/EVENT/HINT lines)
   python3 /gamer/gr.py act '"'"'<json>'"'"'     one action + the new view, e.g. act '"'"'{"type":"say","text":"kit"}'"'"'
-  python3 /gamer/gr.py hunt 120 [--only rat,wolf] [--keep 3] [--retreat 35]
+  python3 /gamer/gr.py hunt 120 [--only rat,wolf] [--keep 3]   (retreats by itself: 35% hp, 50% at L10+)
                                             fights, loots, eats at game speed for up to 120s, stops itself on low HP / nothing to fight / full bag
   python3 /gamer/gr.py knowledge | guild    what you know / the Lantern Guild board
 The game is REAL-TIME at 10 ticks per second: the world does not wait for you. Prefer `hunt` and `walk_to` (one call covers many ticks) over single steps. Every command returns within ~2.5 minutes; never start background processes (no nohup, no &, no while-true). Read the HINT lines — they are the game telling you what to do next. /act always answers HTTP 200: check RESULT ok= and reason=.

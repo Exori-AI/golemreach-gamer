@@ -15,7 +15,7 @@ Goal: as much experience as possible WITHOUT dying. Acting faster never helps �
 
 ## Fighting
 - Survive rule: health ÷ total threat = seconds alive doing nothing. Under ~15 s → walk away.
-- Retreat at 35% hp, not 15%. `hunt` stops itself below --retreat (default 35; at L10+ default 50, never under 40).
+- Retreat at 35% hp, not 15%. `hunt` stops itself below --retreat (default 35; at L10+ never under 50).
 - Death on Efidia (Island Grace): levels 1-4 lose nothing; levels 5-9 lose 3% xp (never below the level floor), nothing else.
   **Grace ENDS at level 10**: from L10 a death on Efidia costs the full mainland price below (~1,000 xp at L10,
   skills, items). At L10+ retreat at 50% hp, never fight hungry, and keep blessings up when gold allows (200 each at L10).
