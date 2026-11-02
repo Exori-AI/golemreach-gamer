@@ -9,7 +9,7 @@ Auth: GR_TOKEN env var (Bearer). Base: GR_BASE (default https://play.golemreach.
 
   gr.py look                      compact view of the world
   gr.py act '<action json>'       one action, then the compact view
-  gr.py hunt [SECS] [--only rat,troll] [--keep N] [--retreat PCT]
+  gr.py hunt [SECS] [--only rat,troll] [--keep N] [--retreat PCT]  (default 35, 50 at L10+)
                                   fight/loot/eat loop, stops itself (default 90s)
   gr.py knowledge                 what this character knows (trimmed)
   gr.py guild                     Lantern Guild board
@@ -210,6 +210,11 @@ def hunt(secs, only, keep, retreat_pct):
         if xp0 is None:
             xp0 = s.get("experience", 0)
             start = s.get("position")
+            # Island Grace ends at L10: a death then costs ~10% xp, so leave earlier.
+            if (s.get("level") or 0) >= 10:
+                retreat_pct = 50 if retreat_pct is None else max(retreat_pct, 40)
+            elif retreat_pct is None:
+                retreat_pct = 35
         evs = [(e.get("text") or e.get("message") or "") for e in obs.get("events") or []]
         for t in evs:
             if "defeated" in t:
@@ -324,7 +329,7 @@ def main(argv):
         print(result_line(r))
         print(compact(obs_of(r)))
     elif cmd == "hunt":
-        secs, only, keep, retreat = 90, [], 0, 35
+        secs, only, keep, retreat = 90, [], 0, None
         rest = argv[1:]
         i = 0
         while i < len(rest):
