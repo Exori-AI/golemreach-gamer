@@ -5,9 +5,12 @@ A party of four on one runner: **Vallum** (knight), **Adori** (paladin), **Favil
 
 ## How it plays
 - `gamer/run.sh` — the runner. Each character runs its own loop, concurrently, with staggered starts
-  (`GAMER_STAGGER_SECONDS`, default 30 min; `GAMER_MAX_CONCURRENT`, default 4). A character plays a bounded
-  window (default 2 h), then rests offline (stamina only recovers while logged out). Inside a window it loops agent sessions
-  until the window ends, then a short wrap-up session parks the character in town.
+  (`GAMER_STAGGER_SECONDS`, default 30 min) and at most `GAMER_MAX_CONCURRENT` online (default 3: a fourth
+  shared the rate limit and cost more than it earned). A character plays a bounded window (default 2 h), then
+  rests 30 min (the game dropped stamina on 10-29). Inside a window it loops agent sessions until the window
+  ends, then a short wrap-up session parks the character in town. A daily quiet gap
+  (`GAMER_QUIET_START_UTC`/`GAMER_QUIET_SECONDS`, default 02:00-04:00 UTC) keeps everyone offline so
+  host maintenance can run; windows are clamped to end before it.
 - `gamer/gr.py` — tiny stdlib HTTP client the model calls: compact views, single actions, and a bounded
   `hunt` routine that fights, loots, eats and retreats on its own. A slow or cheap model stays viable
   because tick-level work happens in code, decisions happen in the model. Nothing runs in the background.
@@ -19,7 +22,7 @@ A party of four on one runner: **Vallum** (knight), **Adori** (paladin), **Favil
 Each window is split between a **Codex** session (`gpt-5.6-terra` via the `codex` CLI) and a
 **free-tier open model** (NVIDIA-hosted, through the hermes agent) on the same character. The order
 alternates per window: odd windows start on Codex, even windows play the first half on the free model,
-so neither arm always gets the freshly rested character. When Codex is out of usage the free model plays
+so neither arm always plays the window's first half. When Codex is out of usage the free model plays
 the rest; if the limit message names its reset time, the Codex arm is held until then. Errors never
 loop: two failed or four short sessions in a row end the Codex arm for that window.
 On the free model, characters take turns over `GAMER_FREE_MODELS` (slot i plays model i mod n), so one

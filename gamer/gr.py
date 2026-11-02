@@ -14,7 +14,7 @@ Auth: GR_TOKEN env var (Bearer). Base: GR_BASE (default https://play.golemreach.
   gr.py knowledge                 what this character knows (trimmed)
   gr.py guild                     Lantern Guild board
   gr.py enter CHARACTER_ID        enter the world
-  gr.py status                    one-line JSON: level/xp/hp/stamina (runner use)
+  gr.py status                    one-line JSON: level/xp/hp/hunger (runner use)
   gr.py home [SECS]               walk to the temple protection zone and wait there (runner use)
   gr.py feedback '<answers json>' answer the level 5/8/10 survey (published publicly)
 """
@@ -104,7 +104,7 @@ def compact(obs, events_max=12, hints_max=4):
     out.append(
         f"SELF {s.get('name')} L{s.get('level')} {s.get('vocation')} xp {s.get('experience')}/{s.get('experienceToNextLevel')}"
         f" hp {s.get('health')}/{s.get('maxHealth')} mp {s.get('mana')}/{s.get('maxMana')}"
-        f" cap {s.get('capacity')} stamina {s.get('stamina')} @ {pos(s.get('position'))}"
+        f" cap {s.get('capacity')} @ {pos(s.get('position'))}"
         f" hungry={s.get('hungry')} fed={s.get('fedSeconds')}s"
         + (f" busy={json.dumps(busy, separators=(',', ':'))}" if busy else "")
         + (f" conditions={s.get('conditions')}" if s.get("conditions") else ""))
@@ -112,6 +112,11 @@ def compact(obs, events_max=12, hints_max=4):
     eq = {k: v.get("defId") for k, v in (inv.get("equipment") or {}).items() if isinstance(v, dict)}
     bp = [f"{i.get('defId')}x{i.get('count', 1)}#{i.get('uid')}" for i in inv.get("backpack") or []]
     out.append(f"GEAR {eq} gold={inv.get('gold')} PACK {bp[:20]}")
+    isl = obs.get("island") or {}
+    if isl:
+        n = isl.get("notches") or {}
+        out.append(f"ISLAND onIsland={isl.get('onIsland')} ferry notches {n.get('have')}/{n.get('need')}"
+                   f" ferryReady={isl.get('ferryReady')} (crossing is ONE WAY: see WORLD_FACTS)")
     m = obs.get("map") or {}
     if m.get("rows"):
         o = m.get("origin") or {}
@@ -159,7 +164,7 @@ def status():
     o = obs_of(observe())
     s = o.get("self") or {}
     print(json.dumps({k: s.get(k) for k in ("name", "level", "experience", "health", "maxHealth",
-                                            "stamina", "hungry", "position")}))
+                                            "hungry", "position")}))
 
 
 HOME = tuple(int(v) for v in os.environ.get("GR_HOME", "497,492,0").split(","))   # Efidia temple (P zone)
@@ -193,6 +198,7 @@ def hunt(secs, only, keep, retreat_pct):
     full capacity. Prints a summary the LLM can act on."""
     end = time.time() + secs
     kills, xp0, log, stop_reason = 0, None, [], "time up"
+    starving = False
     start = None
     last_target_pick = 0
     obs = obs_of(observe())
@@ -242,6 +248,7 @@ def hunt(secs, only, keep, retreat_pct):
                 obs = obs_of(r) or obs
                 time.sleep(1)
                 continue
+            starving = True
         # 3. retreat
         if hp * 100 < retreat_pct * mhp:
             act({"type": "stop", "what": "attack"})
@@ -288,6 +295,8 @@ def hunt(secs, only, keep, retreat_pct):
         obs = obs_of(observe()) or obs
     s = obs.get("self") or {}
     print(f"HUNT END: {stop_reason}. kills={kills} xp {xp0} -> {s.get('experience')}")
+    if starving:
+        print("  NO FOOD in pack while hungry (no regeneration): go to town, buy 15+ bread and eat until full before hunting again")
     for l in log[-15:]:
         print("  " + l)
     print(compact(obs, events_max=6, hints_max=2))

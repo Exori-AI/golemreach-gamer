@@ -6,8 +6,11 @@ glass cannon, who trains magic level by spending mana and keeps distance from ev
 
 ## Every window starts with
 1. python3 /gamer/gr.py look — read SELF, GEAR, HINT, EVENT lines.
-2. If hungry or fed < 60s: eat. Hungry = no mana or health regeneration at all.
-   No bread? Buy some, or "relief" at Brother Pitt (level ≤7, broke).
+2. If hungry or fed < 60s: eat.
+   Hungry = no regeneration at all, and a protection zone never heals you. FOOD IS YOUR FIRST JOB:
+   carry 15+ bread (Pel Marrow general store, trade from (506,526), 8 gp) or ham (Gods Barrow tavern,
+   16 gp) into every hunt, and eat until "You are full" (20 min stored) before leaving town.
+   After a death, buy and eat food before anything else. Loot boar meat. Relief (Brother Pitt) ends at level 7.
 3. Set reflexes once (healing runs between your commands, from your own mana):
    act '{"type":"set_combat_rules","rules":[{"condition":{"type":"self_hp_below","percent":70},"effect":{"type":"cast_spell","spell":"light_healing"}}]}'
 4. Follow GAME_GOALS.md "EXACT FIRST ACTION" if present.
@@ -25,6 +28,14 @@ glass cannon, who trains magic level by spending mana and keeps distance from ev
 - Sell loot and bank gold every ~20 minutes. Keep 1-2 mana potions once affordable.
 - Ask every NPC "where can I hunt?" and "have you got a job for me?". Quests are free xp and
   safe for a fragile character. Take Lantern Guild expeditions that don't need melee.
+
+## Level 10-13: the crossing (ONE WAY, see WORLD_FACTS "Leaving the island")
+- ferryReady does not mean go. Stay on Efidia until level 12: island deaths cost 3% xp,
+  mainland deaths 10% xp, 10% skill and can drop your items.
+- Cross only when you carry all of: gold for "bless me all" at the temple (20+18×level each,
+  ~1,180 gold at level 12, from CARRIED gold, so withdraw first), 15+ food, and 200+ gold spare.
+  Buy all five blessings right before you walk to Old Cassian. Never cross unblessed or broke.
+- Bank toward it now: sell loot you do not use, and spend nothing on extras.
 
 ## Hard rules
 - Retreat at 50% hp (--retreat 50). Anything adjacent is an emergency: walk away first, heal second.

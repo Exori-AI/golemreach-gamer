@@ -4,8 +4,9 @@
 # The game is real-time (10 ticks/s) and a slow LLM can't react per tick, so the
 # model plays through /gamer/gr.py: compact views, single actions, and a bounded
 # `hunt` routine that fights/loots/eats at tick speed and stops itself.
-# Stamina drains -1/min online and only recovers offline (+1 per 3 min), so each
-# slot plays a WINDOW then rests REST (3x the window keeps stamina level).
+# The game dropped stamina on 2026-10-29, so a slot rests only a short REST between
+# windows (the coach runs, the 4th character gets a seat). A daily quiet gap keeps
+# every slot offline long enough for the host's db-maintenance job.
 # After each window a cheap coach model distills the play into the notebooks.
 set -u
 
@@ -13,23 +14,30 @@ HERMES_DIR=/home/hermes/.hermes
 WS=/home/hermes/workspace
 BASE="${GAMER_BASE_URL:-https://play.golemreach.com}"
 WINDOW_SECONDS="${PLAY_WINDOW_SECONDS:-7200}"     # 2h online per window
-REST_SECONDS="${REST_SECONDS:-21600}"             # 6h offline -> +120 stamina, matches the 2h drain
-# A fixed rest only holds stamina where it is. Kill xp is halved at <=840, and
-# by mid-October every window started near 116 and drained to ~0. So the rest
-# runs until the next window can start above the floor plus one window's drain
-# and one death (-60), capped at REST_MAX.
-STAMINA_FLOOR="${GAMER_STAMINA_FLOOR:-840}"
-REST_MAX="${GAMER_REST_MAX_SECONDS:-259200}"       # 72h
+# Until 10-29 the rest refilled stamina (6h); with no stamina it only idled the party
+# (online ~25% of wall time, 213 xp per wall-hour 10-26..11-02).
+REST_SECONDS="${REST_SECONDS:-1800}"              # 30 min offline between windows
+REST_MAX="${GAMER_REST_MAX_SECONDS:-259200}"       # 72h, caps the breaker hold
 WRAPUP_SECONDS="${WRAPUP_SECONDS:-600}"
 COACH_MODEL="${COACH_MODEL:-nvidia/nemotron-3.5-super-vl-120b-a12b}"
 COACH_TIMEOUT="${COACH_TIMEOUT:-900}"
 PLAY_MAX_TURNS="${PLAY_MAX_TURNS:-300}"
-# ~3.5 model calls/min per live session; 4 fit the free tier's rate limit.
-MAX_CONCURRENT="${GAMER_MAX_CONCURRENT:-4}"
+# Free windows >=30 min 10-27..11-02, xp per online hour by how many were live:
+# 1 -> 144, 2 -> 243, 3 -> 211, 4 -> 159 (and 0 once a window hit 5+ NVIDIA 429s).
+# 3 seats is the best party total; the 4th character waits for a seat.
+MAX_CONCURRENT="${GAMER_MAX_CONCURRENT:-3}"
 # Offsets between slot starts. Keep the span short so every cycle still has a
 # window where ALL slots rest (the db-maintenance job only runs then).
 STAGGER_SECONDS="${GAMER_STAGGER_SECONDS:-1800}"
 SEAT_DIR=/tmp/gamer-seats
+# The host db-maintenance job (cron :17 every 2h) stops this container, so it acts
+# only when EVERY slot's next window is >60 min away. Without stamina rests that
+# never happens by itself, so the party keeps a daily quiet gap: windows are
+# clamped to end QUIET_LEAD before it (wrap-up + coach) and none starts inside it.
+QUIET_START_UTC="${GAMER_QUIET_START_UTC-2}"       # hour, UTC; empty = no gap
+QUIET_SECONDS="${GAMER_QUIET_SECONDS:-7200}"       # 02:00-04:00 UTC: the 02:17 job run fits
+QUIET_LEAD=$(( WRAPUP_SECONDS + COACH_TIMEOUT + 600 ))
+MIN_WINDOW_SECONDS="${GAMER_MIN_WINDOW_SECONDS:-1800}"   # shorter than this -> wait out the gap
 # Each window first asks the host for a Codex window (codex/dispatch.sh); on a
 # usage/rate limit, no pickup or an error the free model plays the rest of it.
 CODEX_MODE="${GAMER_CODEX:-on}"
@@ -248,20 +256,25 @@ window_deaths() { awk -F'\t' -v a="$WIN_START" '$1>=a' "$WS/$1/DEATHS.tsv" 2>/de
 
 codex_held() { [ "$(cat "$CODEX_HOLD" 2>/dev/null || echo 0)" -gt "$(date +%s)" ] 2>/dev/null; }
 
-stamina_of() {   # stamina_of <status json> -> stamina or ?
-    printf '%s' "$1" | python3 -c 'import json,sys
-try: print(json.load(sys.stdin).get("stamina","?"))
-except Exception: print("?")' 2>/dev/null
+quiet_next() {   # quiet_next <epoch> -> start of the first quiet gap that ends after it
+    local q=$(( $1 / 86400 * 86400 + 10#$QUIET_START_UTC * 3600 ))
+    [ $(( q + QUIET_SECONDS )) -le "$1" ] && q=$(( q + 86400 ))
+    echo "$q"
 }
 
-rest_for() {   # rest_for <stamina> -> seconds offline before the next window
-    local st="$1" need r
-    case "$st" in ''|*[!0-9]*) echo "$REST_SECONDS"; return ;; esac
-    need=$(( STAMINA_FLOOR + WINDOW_SECONDS / 60 + 60 ))
-    r=$(( (need - st) * 180 + 600 ))   # +1 per 3 min offline, after a ~10 min idle-out
-    [ "$r" -lt "$REST_SECONDS" ] && r=$REST_SECONDS
-    [ "$r" -gt "$REST_MAX" ] && r=$REST_MAX
-    echo "$r"
+playable_from() {   # playable_from <epoch> -> first time >= epoch a window may start
+    local q
+    [ -n "$QUIET_START_UTC" ] || { echo "$1"; return; }
+    q=$(quiet_next "$1")
+    if [ $(( $1 + MIN_WINDOW_SECONDS + QUIET_LEAD )) -gt "$q" ]; then echo $(( q + QUIET_SECONDS )); else echo "$1"; fi
+}
+
+window_end() {   # window_end <start> -> start + WINDOW, clamped to end QUIET_LEAD before the gap
+    local e=$(( $1 + WINDOW_SECONDS )) q
+    [ -n "$QUIET_START_UTC" ] || { echo "$e"; return; }
+    q=$(quiet_next "$1")
+    [ "$e" -gt $(( q - QUIET_LEAD )) ] && e=$(( q - QUIET_LEAD ))
+    echo "$e"
 }
 
 xp_of() {   # xp_of <status json> -> "level experience"
@@ -278,7 +291,7 @@ model_row() {   # slot model t0 t1 before after sessions stalls errors note
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$GR_CHARACTER" "$2" \
         "$(date -u -d "@$3" '+%FT%TZ')" "$(date -u -d "@$4" '+%FT%TZ')" "$(( ($4 - $3 + 30) / 60 ))" \
         "$(xp_of "$5" | tr ' ' '\t')" "$(xp_of "$6" | tr ' ' '\t')" "$deaths" "$7" "$8" "$9" \
-        "$(printf '%s st=%s>%s' "${10}" "$(stamina_of "$5")" "$(stamina_of "$6")" | tr '\t\n' '  ' | head -c 200)" >> "$f"
+        "$(printf '%s' "${10}" | tr '\t\n' '  ' | head -c 200)" >> "$f"
 }
 
 # codex_window <slot> <end>: blocks while Codex plays; sets CODEX_STATE
@@ -409,14 +422,20 @@ play_window() {
     GR_CHARACTER=$(slot_var "$slot" CHARACTER_ID)
     local out rc left start end before after
     start=$(date +%s)
-    end=$(( start + WINDOW_SECONDS ))
+    end=$(playable_from "$start")
+    if [ "$end" -gt "$start" ]; then   # too close to (or inside) the daily quiet gap
+        echo "$end" > "$(state_file "$slot")"
+        log "slot $slot: daily quiet gap (db maintenance) — next window $(date -u -d "@$end" '+%F %T') UTC"
+        return
+    fi
+    end=$(window_end "$start")
     WIN_START=$start
     BREAKER=0
     : > "$dir/WINDOW_TRANSCRIPT.txt"
     out=$(python3 /gamer/gr.py enter "$GR_CHARACTER" 2>&1 | head -3)
     case "$out" in
         "ENTER error"*) log "slot $slot: enter failed: $(printf '%s' "$out" | head -c 300)"
-            echo $(( start + 1800 )) > "$(state_file "$slot")"; return ;;
+            playable_from $(( start + 1800 )) > "$(state_file "$slot")"; return ;;
     esac
     before=$(python3 /gamer/gr.py status 2>&1)
     log "slot $slot: window open until $(date -u -d "@$end" '+%T') UTC — $before"
@@ -457,12 +476,7 @@ play_window() {
     printf 'window %s -> %s UTC\nbefore: %s\nafter:  %s\n' \
         "$(date -u -d "@$start" '+%F %T')" "$(date -u '+%F %T')" "$before" "$after" > "$dir/WINDOW_STATS.txt"
     # no logout endpoint: the character idles out ~10 min after its last action.
-    local st; st=$(stamina_of "$after")
-    case "$st" in ''|*[!0-9]*)   # offline at close: estimate from the start minus the drain
-        st=$(stamina_of "$before")
-        case "$st" in ''|*[!0-9]*) ;; *) st=$(( st - ($(date +%s) - start) / 60 )); [ "$st" -lt 0 ] && st=0 ;; esac ;;
-    esac
-    local rest; rest=$(rest_for "$st")
+    local rest=$REST_SECONDS
     if [ "$BREAKER" = 1 ]; then
         local trips hold; trips=$(( $(cat "$dir/.breaker-trips" 2>/dev/null || echo 0) + 1 ))
         echo "$trips" > "$dir/.breaker-trips"
@@ -473,13 +487,13 @@ play_window() {
     else
         rm -f "$dir/.breaker-trips"
     fi
-    echo $(( $(date +%s) + rest )) > "$(state_file "$slot")"
-    log "slot $slot: stamina $st — resting until $(date -u -d "@$(read_state "$slot")" '+%F %T') UTC"
+    playable_from $(( $(date +%s) + rest )) > "$(state_file "$slot")"
+    log "slot $slot: resting until $(date -u -d "@$(read_state "$slot")" '+%F %T') UTC"
     unset GR_TOKEN
     [ "$BREAKER" = 1 ] || run_coach "$slot"
     rotate_logs "$dir"
-    # sessions are copied into the notebooks; 14 days of them grew state.db to 1.5G
-    hermes sessions prune --older-than 5 -y >/dev/null 2>&1
+    # sessions are copied into the notebooks; the host job archives older ones (retention 2d)
+    hermes sessions prune --older-than 2 -y >/dev/null 2>&1
 }
 
 # drop schedule files of slots that are not active, so nothing (e.g. the
