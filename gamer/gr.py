@@ -83,6 +83,24 @@ def note_deaths(o):
             pass
 
 
+KILLER = re.compile(r"killed by (.+?) at -?\d+,")
+
+
+def recent_deaths(window_s):
+    """[(ts, killer)] from $GR_EVENTS_FILE in the last window_s seconds."""
+    path = os.environ.get("GR_EVENTS_FILE")
+    out = []
+    try:
+        for line in open(path).read().splitlines():
+            ts, _, t = line.partition("\t")
+            m = KILLER.search(t)
+            if m and time.time() - float(ts) < window_s:
+                out.append((float(ts), m.group(1).strip().lower()))
+    except (OSError, TypeError, ValueError):
+        pass
+    return out
+
+
 def pos(p):
     return f"{p.get('x')},{p.get('y')},{p.get('z')}" if p else "?"
 
@@ -200,6 +218,7 @@ def hunt(secs, only, keep, retreat_pct):
     kills, xp0, log, stop_reason = 0, None, [], "time up"
     starving = False
     start = None
+    banned, guard = set(), ""
     last_target_pick = 0
     obs = obs_of(observe())
     while time.time() < end:
@@ -215,6 +234,14 @@ def hunt(secs, only, keep, retreat_pct):
                 retreat_pct = max(retreat_pct or 0, 50)
             elif retreat_pct is None:
                 retreat_pct = 35
+            # Death-loop floor (2026-11-09): W46 had 3-4 deaths in 2h to the same species
+            # at the same spot. The killer is off-limits for 60 min; 2+ deaths in 2h = 65%.
+            banned = {k for _, k in recent_deaths(3600)}
+            if len(recent_deaths(7200)) >= 2:
+                retreat_pct = max(retreat_pct, 65)
+            if banned:
+                guard = ("death-loop guard: not attacking %s for 60 min after a death; "
+                           "retreat %d%%" % (", ".join(sorted(banned)), retreat_pct))
         evs = [(e.get("text") or e.get("message") or "") for e in obs.get("events") or []]
         for t in evs:
             if "defeated" in t:
@@ -281,9 +308,12 @@ def hunt(secs, only, keep, retreat_pct):
         if not busy.get("attacking") and time.time() - last_target_pick > 1.5:
             mons = [c for c in obs.get("creatures") or []
                     if c.get("kind") == "monster" and c.get("reachable") is not False
-                    and (not only or any(o in str(c.get("name", "")).lower() for o in only))]
+                    and (not only or any(o in str(c.get("name", "")).lower() for o in only))
+                    and str(c.get("name", "")).lower() not in banned]
             if not mons:
                 stop_reason = "no suitable monster in view — move to another spot"
+                if banned:
+                    stop_reason += " (you died here recently: hunt somewhere weaker)"
                 break
             tgt = min(mons, key=lambda c: c.get("distance", 99))
             a = {"type": "attack", "targetId": tgt["id"], "stance": "balanced", "chase": True}
@@ -300,6 +330,8 @@ def hunt(secs, only, keep, retreat_pct):
         obs = obs_of(observe()) or obs
     s = obs.get("self") or {}
     print(f"HUNT END: {stop_reason}. kills={kills} xp {xp0} -> {s.get('experience')}")
+    if guard:
+        print("  " + guard)
     if starving:
         print("  NO FOOD in pack while hungry (no regeneration): go to town, buy 15+ bread and eat until full before hunting again")
     for l in log[-15:]:
