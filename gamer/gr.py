@@ -366,7 +366,7 @@ def main(argv):
         i = 0
         while i < len(rest):
             if rest[i] == "--only":
-                only = [x.strip().lower() for x in rest[i + 1].split(",") if x.strip()]; i += 2
+                only = [x.strip().lower().replace("_", " ") for x in rest[i + 1].split(",") if x.strip()]; i += 2
             elif rest[i] == "--keep":
                 keep = int(rest[i + 1]); i += 2
             elif rest[i] == "--retreat":
