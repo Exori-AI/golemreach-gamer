@@ -66,6 +66,14 @@ DEATH_STOP="${GAMER_DEATH_STOP:-3}"
 BREAKER_AFTER="${GAMER_BREAKER_AFTER:-3}"
 BREAKER_HOLD="${GAMER_BREAKER_HOLD_SECONDS:-21600}"   # 6h
 BREAKER=0
+# Upstream outages (NIM 502/503 "temporarily unavailable", timeouts, dropped
+# connections) are not a bug in the slot. W47 they were all 11 breaker trips, each
+# a 6h+ hold (~60 seat-h lost) for a blip that cleared within the hour. They back off
+# longer, trip only after more of them, hold 1h and do not count toward the doubling.
+TRANSIENT_RE='HTTP 50[0234]|temporarily unavailable|timed out|Connection error'
+TRANSIENT_AFTER="${GAMER_TRANSIENT_AFTER:-5}"
+TRANSIENT_HOLD="${GAMER_TRANSIENT_HOLD_SECONDS:-3600}"   # 1h
+BREAKER_SOFT=0
 
 # Nth slot in GAMER_SLOTS reads GAMERn_API_KEY (Bearer token) and
 # GAMERn_CHARACTER_ID; playstyle comes from gamer/strategy-<slot>.md.
@@ -398,14 +406,18 @@ free_segment() {
             else
                 same=0; last_sig=""
             fi
-            if [ "$BREAKER_AFTER" -gt 0 ] && [ "$same" -ge "$BREAKER_AFTER" ]; then
-                BREAKER=1
-                log "slot $slot: BREAKER — $same sessions in a row ended on: $sig"
-                printf '%s\t%s\t%s\t%s\n' "$(date -u '+%FT%TZ')" "$slot" "$model" "$sig" >> "$WS/BREAKER.tsv"
+            local transient=0 limit=$BREAKER_AFTER pause=5
+            if [ -n "$sig" ] && printf '%s' "$sig" | grep -qE "$TRANSIENT_RE"; then
+                transient=1; limit=$TRANSIENT_AFTER; pause=$(( 180 + RANDOM % 240 ))
+            fi
+            if [ "$limit" -gt 0 ] && [ "$same" -ge "$limit" ]; then
+                BREAKER=1; BREAKER_SOFT=$transient
+                log "slot $slot: BREAKER — $same sessions in a row ended on: $sig$([ "$transient" = 1 ] && echo ' (upstream, soft)')"
+                printf '%s\t%s\t%s\t%s\n' "$(date -u '+%FT%TZ')" "$slot" "$model" "$([ "$transient" = 1 ] && echo 'soft: ')$sig" >> "$WS/BREAKER.tsv"
                 break
             fi
-            log "slot $slot: session ended (exit $rc) — continuing in 5s"
-            sleep 5
+            log "slot $slot: session ended (exit $rc) — continuing in ${pause}s"
+            sleep "$pause"
         fi
     done
     [ "$sessions" -gt 0 ] || return
@@ -430,7 +442,7 @@ play_window() {
     fi
     end=$(window_end "$start")
     WIN_START=$start
-    BREAKER=0
+    BREAKER=0; BREAKER_SOFT=0
     : > "$dir/WINDOW_TRANSCRIPT.txt"
     out=$(python3 /gamer/gr.py enter "$GR_CHARACTER" 2>&1 | head -3)
     case "$out" in
@@ -477,7 +489,10 @@ play_window() {
         "$(date -u -d "@$start" '+%F %T')" "$(date -u '+%F %T')" "$before" "$after" > "$dir/WINDOW_STATS.txt"
     # no logout endpoint: the character idles out ~10 min after its last action.
     local rest=$REST_SECONDS
-    if [ "$BREAKER" = 1 ]; then
+    if [ "$BREAKER" = 1 ] && [ "$BREAKER_SOFT" = 1 ]; then
+        [ "$TRANSIENT_HOLD" -gt "$rest" ] && rest=$TRANSIENT_HOLD
+        log "slot $slot: upstream outage — slot held $(( rest / 60 ))min (not counted as a strike)"
+    elif [ "$BREAKER" = 1 ]; then
         local trips hold; trips=$(( $(cat "$dir/.breaker-trips" 2>/dev/null || echo 0) + 1 ))
         echo "$trips" > "$dir/.breaker-trips"
         hold=$(( BREAKER_HOLD << (trips > 4 ? 4 : trips - 1) ))
