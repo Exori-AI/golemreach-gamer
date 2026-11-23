@@ -185,13 +185,20 @@ def status():
                                             "hungry", "position")}))
 
 
-HOME = tuple(int(v) for v in os.environ.get("GR_HOME", "497,492,0").split(","))   # Efidia temple (P zone)
+# Temple P zones; home() walks to the nearest. Brecca first: the whole party is on the mainland
+# since L10 and the Efidia temple is unreachable from there (every 240 s walk timed out, 11-23).
+HOMES = [tuple(int(v) for v in h.split(",")) for h in
+         os.environ.get("GR_HOME", "646,458,0;497,492,0").split(";") if h.strip()]
+HOME = HOMES[0]
 
 
 def home(secs):
     """End-of-window safety: there is no logout, the character lingers ~10 min after its
     last action. Walk it into the temple protection zone, where monsters cannot enter."""
     deadline = time.time() + secs
+    s0 = (obs_of(observe()).get("self") or {}); p0 = s0.get("position") or {}
+    HOME = min(HOMES, key=lambda h: abs(p0.get("x", 0)-h[0]) + abs(p0.get("y", 0)-h[1])
+               + (0 if p0.get("z", 0) == h[2] else 10**6))
     target = {"x": HOME[0], "y": HOME[1], "z": HOME[2]}
     sent = 0
     while time.time() < deadline:

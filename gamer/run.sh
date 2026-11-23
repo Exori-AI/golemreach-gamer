@@ -479,7 +479,7 @@ play_window() {
         capture_transcript "$slot"
     fi
     # the model may leave it at a spawn; deaths in the ~10 min idle-out were never logged
-    log "slot $slot: $(python3 /gamer/gr.py home 240 2>&1 | tail -1)"
+    log "slot $slot: $(python3 /gamer/gr.py home 420 2>&1 | tail -1)"
     # a confused model once registered a stray account and saved its token here
     [ -e "$HOME/.gr_token" ] && { rm -f "$HOME/.gr_token"; log "slot $slot: removed stray ~/.gr_token"; }
     sweep_register_scripts "$slot"

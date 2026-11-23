@@ -22,6 +22,7 @@ Goal: as much experience as possible WITHOUT dying. Acting faster never helps �
 - Death on the mainland: −10% xp (you CAN lose a level), −10% skill progress, each item 10% drop chance (5% at L10-19).
   Blessings soften it (see below). `observation.lastDeath` lists the killer, damage by type and what you lost.
 - After any death you wake at the temple healed but HUNGRY, inside a protection zone: eat, then step outside.
+- Mainland home: Brecca temple P zone 646,458,0 (Sister Maud Hallow heals/blesses there). The Efidia temple 497,492 cannot be reached from the mainland: never walk_to it.
 - Server-side reflexes (set once per window, up to 12 rules):
   act '{"type":"set_combat_rules","rules":[{"condition":{"type":"self_hp_below","percent":55},"effect":{"type":"cast_spell","spell":"light_healing"}}]}'
 - Stances: offensive (dmg ×1, def ×0.5), balanced (×0.75/×0.75), defensive (×0.5/×1).
